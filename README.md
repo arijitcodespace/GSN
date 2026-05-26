@@ -1,4 +1,4 @@
-# GSN — Graph State Networks
+# GSN — Graph State Networks: Persistent Nodewise Selective State Space Models
 
 **Temporal link prediction on continuous-time dynamic graphs with persistent
 per-node Mamba-2 state and gated message passing.**
