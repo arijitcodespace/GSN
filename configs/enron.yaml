@@ -1,0 +1,60 @@
+dataset:
+  name: tgbl-enron
+  root: data/
+
+model:
+  hidden: 128
+  num_heads: 4
+  head_dim: 32
+  state_dim: 16
+  num_layers: 1
+  embed_dim: 128
+  scorer: mlp
+  commit_alpha: 0.2
+  time_feat_dim: 8
+  time_scale: 86400.0
+  edge_gate_hidden: 32
+  dropout: 0.0
+  self_loops: true
+  pre_message: false       # B0 ablation: feed neighbour summary into the SSM input
+  conv_cache: false        # B  ablation: persistent Mamba-2 conv cache
+  conv_cache_dt_decay: null  # optional: bucket-Δt decay τ for the conv cache
+  intra_bucket_seq: false  # C  ablation: per-event SSM stepping within each bucket
+  conv1d_kernel_size: 4    # Mamba-2 conv kernel width (effective horizon: K * batch_events events; only active when conv_cache=true)
+  noise_scale: 0.005
+  id_dim: 64
+  
+trainer:
+  lr: 3.0e-4
+  beta_1: 0.9
+  beta_2: 0.999
+  weight_decay: 0.0
+  clip_norm: 1.0
+  loss_fn: ce
+  lambda_wr: 1.0e-4
+  epochs: 5
+  batch_events: 10000
+  accumulate_every: 1
+  train_neg_per_pos: 1
+  val_test_neg_per_pos: 49
+  seed: 1337
+  weights_dir: checkpoints/tgbl-enron/
+  save_every_epoch: false  # write epoch_NNN.weights.h5 + buffers every epoch so we can post-hoc pick the actual peak
+  train_on_val: true
+# ---------------------------------------------------------------------------
+# Adaptive node-wise commit gate
+# Medium-grained dataset (daily time_scale, commit_alpha: 0.2 is already low).
+# adaptive_hazard available for ablation if needed.
+# ---------------------------------------------------------------------------
+adaptive_commit:
+  commit_mode: adaptive_hazard          # "uniform" = constant commit | "adaptive_hazard" = learned gate
+  gate_hidden: 64
+  gate_layers: 2
+  alpha_min: 1.0e-4
+  alpha_max: 0.999
+  lambda_min: 1.0e-5
+  exposure_delta0: 0.05
+  exposure_cn: 0.25
+  lambda_alpha_prior: 1.0e-3
+  lambda_alpha_saturation: 1.0e-4
+  alpha_warmup_epochs: 2

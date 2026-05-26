@@ -1,0 +1,63 @@
+dataset:
+  name: tgbl-wiki
+  root: data/
+
+model:
+  hidden: 384
+  num_heads: 12
+  head_dim: 32          # hidden // num_heads
+  state_dim: 16         # SSM state dim per head
+  num_layers: 1
+  embed_dim: 128
+  scorer: dot
+  commit_alpha: 0.999
+  time_feat_dim: 8
+  # time_scale: 604800.0  # 7 days in seconds
+  time_scale: 60.0
+  edge_gate_hidden: 32
+  dropout: 0.0
+  self_loops: false
+  pre_message: false      # B0 ablation: feed neighbour summary into the SSM input
+  conv_cache: true       # B  ablation: persistent Mamba-2 conv cache
+  conv_cache_dt_decay: null
+  intra_bucket_seq: false # C  ablation: per-event SSM stepping within each bucket
+  conv1d_kernel_size: 8   # Mamba-2 conv kernel width (effective horizon: K * batch_events events; only active when conv_cache=true)
+  noise_scale: 0.0
+  id_dim: 64
+  temp: 0.541
+
+trainer:
+  lr: 1.0e-4
+  beta_1: 0.9
+  beta_2: 0.999
+  weight_decay: 0.0
+  clip_norm: 1.0
+  loss_fn: ce
+  lambda_wr: 0.0
+  epochs: 10
+  batch_events: 256
+  accumulate_every: 1
+  train_neg_per_pos: 49
+  val_test_neg_per_pos: 1
+  seed: 2020
+  weights_dir: checkpoints/tgbl-wiki/
+  save_every_epoch: true  # write epoch_NNN.weights.h5 + buffers every epoch so we can post-hoc pick the actual peak
+  train_on_val: true
+# ---------------------------------------------------------------------------
+# Adaptive node-wise commit gate
+# Set commit_mode: adaptive_hazard to enable the learned per-node α gate.
+# All other fields are ignored when commit_mode: uniform (old behaviour).
+# Fine-grained dataset — adaptive_hazard is the primary experimental target.
+# ---------------------------------------------------------------------------
+adaptive_commit:
+  commit_mode: uniform          # "uniform" = constant commit | "adaptive_hazard" = learned gate
+  gate_hidden: 64
+  gate_layers: 1
+  alpha_min: 1.0e-4
+  alpha_max: 0.999
+  lambda_min: 1.0e-5
+  exposure_delta0: 0.05
+  exposure_cn: 0.0
+  lambda_alpha_prior: 1.0e-3
+  lambda_alpha_saturation: 1.0e-4
+  alpha_warmup_epochs: 2
