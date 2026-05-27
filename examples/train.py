@@ -181,7 +181,24 @@ def main():
         # that (a) an old uniform checkpoint can be upgraded to adaptive_hazard
         # without re-training from scratch, and (b) the current YAML's commit
         # mode is respected even when config.json in the checkpoint is stale.
-        ac_override = {
+        config_override = {
+                            "pair_recurrence": bool(mdl_cfg.get("pair_recurrence", False)),
+                            "pair_recurrence_dim": int(mdl_cfg.get("pair_recurrence_dim", 16)),
+                            "pair_recurrence_tau": (
+                                float(mdl_cfg["pair_recurrence_tau"])
+                                if mdl_cfg.get("pair_recurrence_tau") is not None else None
+                            ),
+                            "pair_recurrence_undirected": bool(mdl_cfg.get("pair_recurrence_undirected", False)),
+                            "pair_recurrence_reset_per_epoch": bool(mdl_cfg.get("pair_recurrence_reset_per_epoch", True)),
+                            "query_history": bool(mdl_cfg.get("query_history", False)),
+                            "query_history_k": int(mdl_cfg.get("query_history_k", 16)),
+                            "query_history_dim": int(mdl_cfg.get("query_history_dim", 16)),
+                            "query_history_tau": (
+                                float(mdl_cfg["query_history_tau"])
+                                if mdl_cfg.get("query_history_tau") is not None else None
+                            ),
+                            "query_history_undirected": bool(mdl_cfg.get("query_history_undirected", True)),
+                            "query_history_reset_per_epoch": bool(mdl_cfg.get("query_history_reset_per_epoch", True)),
                             "commit_mode":     str(ac_cfg.get("commit_mode",     "uniform")),
                             "gate_hidden":     int(ac_cfg.get("gate_hidden",     64)),
                             "gate_layers":     int(ac_cfg.get("gate_layers",     2)),
@@ -194,7 +211,7 @@ def main():
         model = GSNLinkPredictor.from_pretrained(
                                                     args.checkpoint,
                                                     edge_feat_dim   = int(meta["edge_feat_dim"]),
-                                                    config_override = ac_override,
+                                                   config_override = config_override,
                                                     epoch = args.from_epoch
                                                 )
     else:
@@ -225,6 +242,23 @@ def main():
                                     noise_scale         = float(mdl_cfg.get("noise_scale", 0.005)),
                                     id_dim           = int(mdl_cfg.get("id_dim", 0)),
                                     temp             = float(mdl_cfg.get("temp", -2.624)),
+                                    pair_recurrence  = bool(mdl_cfg.get("pair_recurrence", False)),
+                                    pair_recurrence_dim = int(mdl_cfg.get("pair_recurrence_dim", 16)),
+                                    pair_recurrence_tau = (
+                                        float(mdl_cfg["pair_recurrence_tau"])
+                                        if mdl_cfg.get("pair_recurrence_tau") is not None else None
+                                    ),
+                                    pair_recurrence_undirected = bool(mdl_cfg.get("pair_recurrence_undirected", False)),
+                                    pair_recurrence_reset_per_epoch = bool(mdl_cfg.get("pair_recurrence_reset_per_epoch", True)),
+                                    query_history  = bool(mdl_cfg.get("query_history", False)),
+                                    query_history_k = int(mdl_cfg.get("query_history_k", 16)),
+                                    query_history_dim = int(mdl_cfg.get("query_history_dim", 16)),
+                                    query_history_tau = (
+                                        float(mdl_cfg["query_history_tau"])
+                                        if mdl_cfg.get("query_history_tau") is not None else None
+                                    ),
+                                    query_history_undirected = bool(mdl_cfg.get("query_history_undirected", True)),
+                                    query_history_reset_per_epoch = bool(mdl_cfg.get("query_history_reset_per_epoch", True)),
                                     # Adaptive commit (ignored when commit_mode = "uniform")
                                     commit_mode      = str(ac_cfg.get("commit_mode", "uniform")),
                                     gate_hidden      = int(ac_cfg.get("gate_hidden", 64)),

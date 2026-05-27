@@ -480,6 +480,17 @@ reference values; consult the per-dataset YAML for tuned defaults.
 | `noise_scale` | float | Gaussian noise injected into state during training (regulariser). |
 | `id_dim` | int | Width of trainable per-node ID embedding (0 to disable). |
 | `temp` | float | Scorer temperature (in the unparameterised raw scale; the model applies softplus internally). |
+| `pair_recurrence` | bool | Enable scorer-side historical pair count/recency features. `false` restores the pre-feature architecture. |
+| `pair_recurrence_dim` | int | Hidden width of the small auxiliary pair-recurrence logit MLP. |
+| `pair_recurrence_tau` | float \| null | Recency decay timescale. `null` falls back to `time_scale`. |
+| `pair_recurrence_undirected` | bool | Canonicalise `(u,v)` and `(v,u)` to the same pair key. |
+| `pair_recurrence_reset_per_epoch` | bool | Reset pair history at each training epoch, matching state-table reset semantics. |
+| `query_history` | bool | Enable bounded scorer-side recent-neighbor history features. `false` restores the pre-feature architecture. |
+| `query_history_k` | int | Number of recent incident positive interactions retained per node. |
+| `query_history_dim` | int | Hidden width of the auxiliary query-history logit MLP. |
+| `query_history_tau` | float \| null | Recency decay timescale. `null` falls back to `time_scale`. |
+| `query_history_undirected` | bool | Store positive edges in both endpoint histories, matching DyGMamba-style undirected temporal neighborhoods. |
+| `query_history_reset_per_epoch` | bool | Reset query-history buffers at each training epoch, matching state-table reset semantics. |
 
 ### `trainer` section
 
@@ -533,7 +544,9 @@ For each training run with `save_every_epoch: true` the trainer writes:
 ├── epoch_001.weights.h5         # per-epoch snapshots
 ├── epoch_002.weights.h5
 ├── ...
-└── activity_buffers.npz         # only when commit_mode = adaptive_hazard
+├── activity_buffers.npz         # only when commit_mode = adaptive_hazard
+├── pair_recurrence.npz          # only when model.pair_recurrence = true
+└── query_history.npz            # only when model.query_history = true
 ```
 
 Use `--from_epoch N` on the evaluator or trainer to point at a specific

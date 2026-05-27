@@ -24,6 +24,17 @@ model:
   noise_scale: 0.0
   id_dim: 64
   temp: 0.541
+  pair_recurrence: false  # scorer-side pair count/recency features; false restores pre-feature architecture
+  pair_recurrence_dim: 16
+  pair_recurrence_tau: null  # null = fall back to model.time_scale
+  pair_recurrence_undirected: false
+  pair_recurrence_reset_per_epoch: false
+  query_history: true      # bounded scorer-side recent-neighbor history side channel
+  query_history_k: 512
+  query_history_dim: 16
+  query_history_tau: null    # null = fall back to model.time_scale
+  query_history_undirected: false
+  query_history_reset_per_epoch: false
 
 trainer:
   lr: 1.0e-4

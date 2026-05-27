@@ -6,14 +6,6 @@ __pycache__/
 *$py.class
 *.so
 
-# --------------------------------------------------------------------------
-# LLM agents
-# --------------------------------------------------------------------------
-.claude/
-.github/
-copilot_verdict.md
-verdict.md
-
 # Build / packaging
 build/
 dist/
@@ -104,3 +96,9 @@ Desktop.ini
 *.tmp
 *.orig
 .cache/
+copilot_verdict.md
+gpt_context.md
+verdict.md
+*/debug.py
+**/*.ipynb
+

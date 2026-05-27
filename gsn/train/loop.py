@@ -38,6 +38,8 @@ try:
     from ..state.table import DenseStateTable
     from ..state.conv_cache import ConvCacheTable
     from ..state.activity_buffers import NodeActivityBuffers
+    from ..state.pair_recurrence import PairRecurrenceBuffers
+    from ..state.query_history import QueryHistoryBuffers
     from ..layers.gsn_block import GSNBlock, PersistentGSNBlock
     from ..layers.adaptive_commit_gate import (
                                                 AdaptiveCommitGate,
@@ -58,6 +60,8 @@ except Exception as e:
     from gsn.state.table import DenseStateTable
     from gsn.state.conv_cache import ConvCacheTable
     from gsn.state.activity_buffers import NodeActivityBuffers
+    from gsn.state.pair_recurrence import PairRecurrenceBuffers
+    from gsn.state.query_history import QueryHistoryBuffers
     from gsn.layers.gsn_block import GSNBlock, PersistentGSNBlock
     from gsn.layers.adaptive_commit_gate import (
                                                   AdaptiveCommitGate,
@@ -126,6 +130,17 @@ class GSNLinkPredictor(keras.Model):
                     noise_scale:      float = 0.005,
                     id_dim:           int   = 0,
                     temp:             float = -2.624,
+                    pair_recurrence:  bool  = False,
+                    pair_recurrence_dim: int = 16,
+                    pair_recurrence_tau: Optional[float] = None,
+                    pair_recurrence_undirected: bool = False,
+                    pair_recurrence_reset_per_epoch: bool = True,
+                    query_history: bool = False,
+                    query_history_k: int = 16,
+                    query_history_dim: int = 16,
+                    query_history_tau: Optional[float] = None,
+                    query_history_undirected: bool = True,
+                    query_history_reset_per_epoch: bool = True,
                     # ---- Adaptive commit parameters ----
                     # commit_mode: "uniform" (default) or "adaptive_hazard"
                     # These mirror the adaptive_commit: section in the YAML config.
@@ -168,6 +183,21 @@ class GSNLinkPredictor(keras.Model):
         self._conv1d_kernel_size = int(conv1d_kernel_size)
         self._noise_scale      = float(noise_scale)
         self._id_dim           = int(id_dim)
+        self._pair_recurrence  = bool(pair_recurrence)
+        self._pair_recurrence_dim = int(pair_recurrence_dim)
+        self._pair_recurrence_tau = (
+            float(pair_recurrence_tau) if pair_recurrence_tau is not None else None
+        )
+        self._pair_recurrence_undirected = bool(pair_recurrence_undirected)
+        self._pair_recurrence_reset_per_epoch = bool(pair_recurrence_reset_per_epoch)
+        self._query_history = bool(query_history)
+        self._query_history_k = int(query_history_k)
+        self._query_history_dim = int(query_history_dim)
+        self._query_history_tau = (
+            float(query_history_tau) if query_history_tau is not None else None
+        )
+        self._query_history_undirected = bool(query_history_undirected)
+        self._query_history_reset_per_epoch = bool(query_history_reset_per_epoch)
         # Adaptive commit
         self._commit_mode      = str(commit_mode)
         self._gate_hidden      = int(gate_hidden)
@@ -186,6 +216,27 @@ class GSNLinkPredictor(keras.Model):
         self.conv_cache_tables: List[Optional[ConvCacheTable]] = []
         self.blocks:            List[PersistentGSNBlock] = []
         self.activity_buffers_list: List[Optional[NodeActivityBuffers]] = []
+        self.pair_recurrence_buffers: Optional[PairRecurrenceBuffers] = None
+        if self._pair_recurrence:
+            self.pair_recurrence_buffers = PairRecurrenceBuffers(
+                num_nodes = self.num_nodes,
+                tau_data = (
+                    self._pair_recurrence_tau
+                    if self._pair_recurrence_tau is not None else self._time_scale
+                ),
+                undirected = self._pair_recurrence_undirected,
+            )
+        self.query_history_buffers: Optional[QueryHistoryBuffers] = None
+        if self._query_history:
+            self.query_history_buffers = QueryHistoryBuffers(
+                num_nodes = self.num_nodes,
+                history_k = self._query_history_k,
+                tau_data = (
+                    self._query_history_tau
+                    if self._query_history_tau is not None else self._time_scale
+                ),
+                undirected = self._query_history_undirected,
+            )
 
         # One shared AdaptiveCommitGate (all layers share the same gate architecture;
         # each could in principle have its own, but one gate is sufficient for now).
@@ -293,6 +344,16 @@ class GSNLinkPredictor(keras.Model):
                                             embed_dim      = self._embed_dim,
                                             hidden         = self._embed_dim,
                                             scorer         = self._scorer,
+                                            pair_feature_dim = (
+                                                PairRecurrenceBuffers.feature_dim
+                                                if self._pair_recurrence else 0
+                                            ),
+                                            pair_hidden    = self._pair_recurrence_dim,
+                                            query_history_feature_dim = (
+                                                QueryHistoryBuffers.feature_dim
+                                                if self._query_history else 0
+                                            ),
+                                            query_history_hidden = self._query_history_dim,
                                         )
         self.ln_out = layers.LayerNormalization(epsilon = 1e-6)
 
@@ -331,6 +392,17 @@ class GSNLinkPredictor(keras.Model):
                     "noise_scale":      self._noise_scale,
                     "id_dim":           self._id_dim,
                     "temp":             float(self.temp.numpy()),
+                    "pair_recurrence":  self._pair_recurrence,
+                    "pair_recurrence_dim": self._pair_recurrence_dim,
+                    "pair_recurrence_tau": self._pair_recurrence_tau,
+                    "pair_recurrence_undirected": self._pair_recurrence_undirected,
+                    "pair_recurrence_reset_per_epoch": self._pair_recurrence_reset_per_epoch,
+                    "query_history": self._query_history,
+                    "query_history_k": self._query_history_k,
+                    "query_history_dim": self._query_history_dim,
+                    "query_history_tau": self._query_history_tau,
+                    "query_history_undirected": self._query_history_undirected,
+                    "query_history_reset_per_epoch": self._query_history_reset_per_epoch,
                     # Adaptive commit (safe to include; ignored when commit_mode="uniform")
                     "commit_mode":      self._commit_mode,
                     "gate_hidden":      self._gate_hidden,
@@ -396,6 +468,8 @@ class GSNLinkPredictor(keras.Model):
                                 dummy_src,
                                 dummy_dst,
                                 states = states,
+                                pair_current_ts = np.asarray([2, 2], dtype = np.float32),
+                                query_history_current_ts = np.asarray([2, 2], dtype = np.float32),
                                 training = False,
                             )
 
@@ -462,6 +536,11 @@ class GSNLinkPredictor(keras.Model):
           are plain NumPy arrays, invisible to save_weights().  They are
           restored from ``activity_buffers.npz`` if present; otherwise they
           start from zero with a printed warning.
+        * Pair-recurrence buffers are also plain NumPy/Python state and are
+          restored from ``pair_recurrence.npz`` (or epoch-specific sibling)
+          when ``pair_recurrence=True``.
+        * Query-history buffers follow the same pattern via
+          ``query_history.npz`` when ``query_history=True``.
         * When upgrading from uniform → adaptive, the gate weights will not
           be present in the checkpoint file; load_weights skips them and they
           stay at their initialised values (correct behaviour: gate starts
@@ -489,6 +568,8 @@ class GSNLinkPredictor(keras.Model):
         if epoch is not None:
             weights_path = path / f"epoch_{int(epoch):03d}.weights.h5"
             buf_path     = path / f"epoch_{int(epoch):03d}_activity_buffers.npz"
+            pair_buf_path = path / f"epoch_{int(epoch):03d}_pair_recurrence.npz"
+            query_buf_path = path / f"epoch_{int(epoch):03d}_query_history.npz"
             if not weights_path.exists():
                 available = sorted(p.name for p in path.glob("epoch_*.weights.h5"))
                 raise FileNotFoundError(
@@ -499,6 +580,8 @@ class GSNLinkPredictor(keras.Model):
         else:
             best = path / "best.weights.h5"
             buf_path = path / "activity_buffers.npz"
+            pair_buf_path = path / "pair_recurrence.npz"
+            query_buf_path = path / "query_history.npz"
             if best.exists():
                 weights_path = best
             else:
@@ -508,6 +591,12 @@ class GSNLinkPredictor(keras.Model):
                 weights_path = candidates[-1]
                 buf_path = path / weights_path.name.replace(
                     ".weights.h5", "_activity_buffers.npz"
+                )
+                pair_buf_path = path / weights_path.name.replace(
+                    ".weights.h5", "_pair_recurrence.npz"
+                )
+                query_buf_path = path / weights_path.name.replace(
+                    ".weights.h5", "_query_history.npz"
                 )
 
         print(f"\nLoaded from {weights_path}")
@@ -527,13 +616,29 @@ class GSNLinkPredictor(keras.Model):
         # TRAINABLE variable whose pre-load value was zero — that pattern is
         # diagnostic of a silently-skipped weight.
         skipped_zeros = []
+        pair_unchanged = []
+        pair_changed = 0
+        query_unchanged = []
+        query_changed = 0
         unchanged_total = 0
         for v in model.variables:
             post = v.numpy()
+            is_pair_var = "pair_recurrence" in v.path and v.trainable
+            is_query_var = "query_history" in v.path and v.trainable
             if np.array_equal(pre_snapshot[v.path], post):
                 unchanged_total += 1
+                if is_pair_var:
+                    pair_unchanged.append(v.path)
+                    continue
+                if is_query_var:
+                    query_unchanged.append(v.path)
+                    continue
                 if v.trainable and np.abs(post).sum() == 0.0:
                     skipped_zeros.append(v.path)
+            elif is_pair_var:
+                pair_changed += 1
+            elif is_query_var:
+                query_changed += 1
         if skipped_zeros:
             print(
                 f"  [warning] {len(skipped_zeros)} trainable variable(s) appear "
@@ -542,6 +647,26 @@ class GSNLinkPredictor(keras.Model):
                 "and the checkpoint.  Affected:"
             )
             for p in skipped_zeros:
+                print(f"    - {p}")
+        if model.has_pair_recurrence and pair_unchanged and pair_changed == 0:
+            print(
+                f"  [warning] {len(pair_unchanged)} pair-recurrence scorer "
+                "variable(s) were unchanged by load_weights. If this checkpoint "
+                "predates pair_recurrence, the auxiliary pair logit starts from "
+                "its zero-initialised baseline and must be trained before it can "
+                "contribute. Affected:"
+            )
+            for p in pair_unchanged:
+                print(f"    - {p}")
+        if model.has_query_history and query_unchanged and query_changed == 0:
+            print(
+                f"  [warning] {len(query_unchanged)} query-history scorer "
+                "variable(s) were unchanged by load_weights. If this checkpoint "
+                "predates query_history, the auxiliary history logit starts from "
+                "its zero-initialised baseline and must be trained before it can "
+                "contribute. Affected:"
+            )
+            for p in query_unchanged:
                 print(f"    - {p}")
 
         # Restore activity buffers (adaptive mode only)
@@ -569,11 +694,55 @@ class GSNLinkPredictor(keras.Model):
                     "context (delta_t, ema) is missing."
                 )
 
+        # Restore pair recurrence buffers (pair-recurrence mode only)
+        if model.has_pair_recurrence:
+            if pair_buf_path.exists():
+                model.pair_recurrence_buffers.load_npz(pair_buf_path)
+                print(f"  Pair recurrence buffers restored from {pair_buf_path.name}")
+            else:
+                print(
+                    f"  [warning] {pair_buf_path.name} not found — pair recurrence "
+                    "history initialised empty. Scorer weights may be loaded, but "
+                    "count/recency features will start from zero history."
+                )
+
+        # Restore query history buffers (query-history mode only)
+        if model.has_query_history:
+            if query_buf_path.exists():
+                model.query_history_buffers.load_npz(query_buf_path)
+                print(f"  Query history buffers restored from {query_buf_path.name}")
+            else:
+                print(
+                    f"  [warning] {query_buf_path.name} not found — query history "
+                    "initialised empty. Scorer weights may be loaded, but "
+                    "recent-neighbor features will start from zero history."
+                )
+
         return model
 
     # ------------------------------------------------------------------
 
-    def reset_states_all(self) -> None:
+    @property
+    def has_pair_recurrence(self) -> bool:
+        return self._pair_recurrence and self.pair_recurrence_buffers is not None
+
+    @property
+    def pair_recurrence_reset_per_epoch(self) -> bool:
+        return self._pair_recurrence_reset_per_epoch
+
+    @property
+    def has_query_history(self) -> bool:
+        return self._query_history and self.query_history_buffers is not None
+
+    @property
+    def query_history_reset_per_epoch(self) -> bool:
+        return self._query_history_reset_per_epoch
+
+    def reset_states_all(
+        self,
+        reset_pair_recurrence: bool = True,
+        reset_query_history: bool = True,
+    ) -> None:
         for t in self.state_tables:
             t.reset_state()
         for c in self.conv_cache_tables:
@@ -582,6 +751,28 @@ class GSNLinkPredictor(keras.Model):
         for buf in self.activity_buffers_list:
             if buf is not None:
                 buf.reset()
+        if reset_pair_recurrence and self.pair_recurrence_buffers is not None:
+            self.pair_recurrence_buffers.reset()
+        if reset_query_history and self.query_history_buffers is not None:
+            self.query_history_buffers.reset()
+
+    def update_pair_recurrence(
+                                self,
+                                src: np.ndarray,
+                                dst: np.ndarray,
+                                timestamps: np.ndarray,
+                              ) -> None:
+        if self.pair_recurrence_buffers is not None:
+            self.pair_recurrence_buffers.update(src, dst, timestamps)
+
+    def update_query_history(
+                            self,
+                            src: np.ndarray,
+                            dst: np.ndarray,
+                            timestamps: np.ndarray,
+                          ) -> None:
+        if self.query_history_buffers is not None:
+            self.query_history_buffers.update(src, dst, timestamps)
 
     # ------------------------------------------------------------------
     # Adaptive commit setup (called by Trainer before first epoch)
@@ -814,6 +1005,10 @@ class GSNLinkPredictor(keras.Model):
                         cand_src,
                         cand_dst,
                         states = None,
+                        pair_features = None,
+                        pair_current_ts = None,
+                        query_history_features = None,
+                        query_history_current_ts = None,
                         training = None,
                     ):
         id_to_local = {int(gid): i for i, gid in enumerate(node_ids)}
@@ -845,7 +1040,40 @@ class GSNLinkPredictor(keras.Model):
 
         v_z = self.item_proj(h_dst)
 
-        logits = self.scorer_head(u_z, v_z, training = training)
+        pair_features_tf = None
+        if self.has_pair_recurrence:
+            if pair_features is None:
+                if pair_current_ts is None:
+                    raise ValueError(
+                        "pair_current_ts or pair_features must be provided when "
+                        "pair_recurrence is enabled"
+                    )
+                pair_features = self.pair_recurrence_buffers.get_features(
+                    cand_src, cand_dst, pair_current_ts
+                )
+            pair_features_tf = tf.cast(pair_features, tf.float32)
+        query_history_features_tf = None
+        if self.has_query_history:
+            if query_history_features is None:
+                if query_history_current_ts is None:
+                    query_history_current_ts = pair_current_ts
+                if query_history_current_ts is None:
+                    raise ValueError(
+                        "query_history_current_ts or query_history_features must "
+                        "be provided when query_history is enabled"
+                    )
+                query_history_features = self.query_history_buffers.get_features(
+                    cand_src, cand_dst, query_history_current_ts
+                )
+            query_history_features_tf = tf.cast(query_history_features, tf.float32)
+
+        logits = self.scorer_head(
+            u_z,
+            v_z,
+            pair_features = pair_features_tf,
+            query_history_features = query_history_features_tf,
+            training = training,
+        )
         denom = tf.cast(tf.nn.softplus(self.temp) + 1e-6, tf.float32)
         return tf.cast(logits, tf.float32) / denom
 
@@ -1315,6 +1543,10 @@ class Trainer(keras.Model):
         # 1. Candidates first (their node set drives `snap_pre.node_ids`).
         cand_src, cand_dst, _, sizes = self.neg_sampler.build_candidates(src_b, dst_b, ts = ts_b)
         sizes_tf = tf.cast(sizes, tf.int32)
+        cand_ts = np.repeat(
+            np.asarray(ts_b, dtype = np.float64).reshape(-1),
+            np.asarray(sizes, dtype = np.int64).reshape(-1),
+        )
 
         # 2. Pre-bucket snapshot: edges from the previous bucket only.
         prev = self._prev_bucket
@@ -1367,6 +1599,8 @@ class Trainer(keras.Model):
                                                 cand_src,
                                                 cand_dst,
                                                 states   = states_for_score,
+                                                pair_current_ts = cand_ts,
+                                                query_history_current_ts = cand_ts,
                                                 training = True
                                             )
 
@@ -1394,6 +1628,8 @@ class Trainer(keras.Model):
 
         # 4. Commit state using the END snapshot (the bucket's actual events).
         self.model.forward(snap_end, commit = True, training = False)
+        self.model.update_pair_recurrence(src_b, dst_b, ts_b)
+        self.model.update_query_history(src_b, dst_b, ts_b)
 
         # 5. Save this bucket as G_prev for the next bucket's pre-snapshot.
         self._prev_bucket = (
@@ -1486,7 +1722,10 @@ class Trainer(keras.Model):
             self._pending_beta     = None
 
         for epoch in range(n_initial_epoch, n_epochs):
-            self.model.reset_states_all()
+            self.model.reset_states_all(
+                reset_pair_recurrence = self.model.pair_recurrence_reset_per_epoch,
+                reset_query_history = self.model.query_history_reset_per_epoch,
+            )
             console.rule(f"[bold white]Epoch {epoch + 1} / {n_epochs}")
 
             # Warmup: linearly ramp gate influence from 0 → 1 over warmup_epochs
@@ -1515,10 +1754,10 @@ class Trainer(keras.Model):
             history["train_mrr_1v1"].append(train_m.get("mrr_1v1", 0.0))
 
             # Save training state (DenseStateTable, ConvCacheTable, activity
-            # buffers), evaluate, then restore.  Without restoring the conv
-            # cache, per-epoch eval mutation leaks into the next training
-            # epoch AND contaminates the saved checkpoint, breaking
-            # trainer-vs-standalone evaluator parity for conv_cache models.
+            # buffers, pair-recurrence buffers), evaluate, then restore.
+            # Without restoring these, per-epoch eval mutation leaks into the
+            # next training epoch AND contaminates the saved checkpoint,
+            # breaking trainer-vs-standalone evaluator parity.
             train_states = [t.clone() for t in self.model.state_tables]
             train_caches = [
                 c.clone() if c is not None else None
@@ -1528,6 +1767,14 @@ class Trainer(keras.Model):
                 b.clone() if b is not None else None
                 for b in self.model.activity_buffers_list
             ]
+            train_pair_buf = (
+                self.model.pair_recurrence_buffers.clone()
+                if self.model.pair_recurrence_buffers is not None else None
+            )
+            train_query_buf = (
+                self.model.query_history_buffers.clone()
+                if self.model.query_history_buffers is not None else None
+            )
 
             vmrr, vap, vauc = self._eval_epoch(
                                                 "Val",
@@ -1557,6 +1804,16 @@ class Trainer(keras.Model):
             for buf, saved_buf in zip(self.model.activity_buffers_list, train_act_buf):
                 if buf is not None and saved_buf is not None:
                     buf.copy_from(saved_buf)
+            if (
+                self.model.pair_recurrence_buffers is not None
+                and train_pair_buf is not None
+            ):
+                self.model.pair_recurrence_buffers.copy_from(train_pair_buf)
+            if (
+                self.model.query_history_buffers is not None
+                and train_query_buf is not None
+            ):
+                self.model.query_history_buffers.copy_from(train_query_buf)
 
             history["test_mrr"].append(tmrr)
             history["test_ap"].append(tap)
@@ -1802,6 +2059,14 @@ class Trainer(keras.Model):
             # variables) and are therefore invisible to save_weights().
             if self.model.has_adaptive_commit:
                 np.savez(str(d / "activity_buffers.npz"), **_activity_buffers_dict())
+            if self.model.has_pair_recurrence:
+                self.model.pair_recurrence_buffers.save_npz(
+                    d / "pair_recurrence.npz"
+                )
+            if self.model.has_query_history:
+                self.model.query_history_buffers.save_npz(
+                    d / "query_history.npz"
+                )
 
         if self.cfg.save_every_epoch:
             self.model.save_weights(str(d / f"epoch_{epoch:03d}.weights.h5"))
@@ -1809,6 +2074,14 @@ class Trainer(keras.Model):
                 np.savez(
                     str(d / f"epoch_{epoch:03d}_activity_buffers.npz"),
                     **_activity_buffers_dict(),
+                )
+            if self.model.has_pair_recurrence:
+                self.model.pair_recurrence_buffers.save_npz(
+                    d / f"epoch_{epoch:03d}_pair_recurrence.npz"
+                )
+            if self.model.has_query_history:
+                self.model.query_history_buffers.save_npz(
+                    d / f"epoch_{epoch:03d}_query_history.npz"
                 )
 
         with open(d / "config.json", "w", encoding = "utf-8") as f:

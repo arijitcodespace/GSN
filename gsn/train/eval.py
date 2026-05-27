@@ -348,9 +348,9 @@ def evaluate_split(
     For the ``random`` strategy, a ``loss`` key holds the mean BCE over the
     whole split (used by the trainer's per-epoch summary).
 
-    State side-effects: this function commits node states bucket-by-bucket
-    (matching the trainer's eval semantics). It does NOT reset the model's
-    persistent state before or after.
+    State side-effects: this function commits node states and, when enabled,
+    pair-recurrence history bucket-by-bucket (matching the trainer's eval
+    semantics). It does NOT reset the model's persistent state before or after.
     """
     random_sampler.reset_random_state()
     if inductive_sampler is not None:
@@ -429,10 +429,14 @@ def evaluate_split(
 
             rnd_cand_src = np.concatenate([src_b, rnd_neg_src]).astype(np.int64)
             rnd_cand_dst = np.concatenate([dst_b, rnd_neg_dst]).astype(np.int64)
+            rnd_cand_ts  = np.concatenate([ts_b, ts_b]).astype(np.float64)
             rnd_logits = model.score_pairs(
                 H, snap_pre.node_ids,
                 rnd_cand_src, rnd_cand_dst,
-                states=states_for_score, training=False,
+                states=states_for_score,
+                pair_current_ts=rnd_cand_ts,
+                query_history_current_ts=rnd_cand_ts,
+                training=False,
             )
             rnd_logits_np = tf.reshape(rnd_logits, [-1]).numpy()
             B = int(len(src_b))
@@ -442,16 +446,22 @@ def evaluate_split(
             if ind_neg_src is not None and ind_neg_dst is not None:
                 ind_cand_src = np.concatenate([src_b, ind_neg_src]).astype(np.int64)
                 ind_cand_dst = np.concatenate([dst_b, ind_neg_dst]).astype(np.int64)
+                ind_cand_ts  = np.concatenate([ts_b, ts_b]).astype(np.float64)
                 ind_logits = model.score_pairs(
                     H, snap_pre.node_ids,
                     ind_cand_src, ind_cand_dst,
-                    states=states_for_score, training=False,
+                    states=states_for_score,
+                    pair_current_ts=ind_cand_ts,
+                    query_history_current_ts=ind_cand_ts,
+                    training=False,
                 )
                 ind_logits_np = tf.reshape(ind_logits, [-1]).numpy()
                 ind_pos.append(ind_logits_np[:B])
                 ind_neg.append(ind_logits_np[B:])
 
             model.forward(snap_end, commit=True, training=False)
+            model.update_pair_recurrence(src_b, dst_b, ts_b)
+            model.update_query_history(src_b, dst_b, ts_b)
             prev_bucket = (
                 np.asarray(src_b, dtype=np.int64).copy(),
                 np.asarray(dst_b, dtype=np.int64).copy(),
