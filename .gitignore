@@ -96,6 +96,7 @@ Desktop.ini
 *.tmp
 *.orig
 .cache/
+.claude/
 copilot_verdict.md
 gpt_context.md
 verdict.md
