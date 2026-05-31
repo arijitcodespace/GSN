@@ -172,7 +172,13 @@ def main():
     num_heads = int(mdl_cfg["num_heads"])
     head_dim  = int(mdl_cfg.get("head_dim", hidden // num_heads))
     assert hidden == num_heads * head_dim, f"hidden ({hidden}) must equal num_heads * head_dim ({num_heads} * {head_dim})"
-    
+    batch_events = int(trn_cfg.get("batch_events", 20_000))
+    run_ssm_in_step_mode = bool(mdl_cfg.get("run_ssm_in_step_mode", True))
+    sequence_length = 1 if run_ssm_in_step_mode else batch_events
+    num_chunks = 1 if run_ssm_in_step_mode else int(mdl_cfg.get("num_chunks", 1))
+    if not run_ssm_in_step_mode and batch_events <= 0:
+        raise ValueError("Sequence mode requires trainer.batch_events to be positive.")
+     
     # Adaptive commit section (optional; defaults to uniform mode if absent)
     ac_cfg = raw.get("adaptive_commit", {})
 
@@ -222,6 +228,8 @@ def main():
                                     num_heads        = num_heads,
                                     head_dim         = head_dim,
                                     state_dim        = int(mdl_cfg.get("state_dim", 16)),
+                                    sequence_length  = sequence_length,
+                                    num_chunks       = num_chunks,
                                     num_layers       = int(mdl_cfg.get("num_layers", 1)),
                                     embed_dim        = int(mdl_cfg.get("embed_dim", hidden)),
                                     scorer           = str(mdl_cfg.get("scorer", "mlp")),
@@ -229,9 +237,10 @@ def main():
                                     time_feat_dim    = int(mdl_cfg.get("time_feat_dim", 8)),
                                     time_scale       = float(mdl_cfg.get("time_scale", 86400.0)),
                                     edge_gate_hidden = int(mdl_cfg.get("edge_gate_hidden", 32)),
-                                    dropout             = float(mdl_cfg.get("dropout", 0.0)),
-                                    self_loops          = bool(mdl_cfg.get("self_loops", True)),
-                                    pre_message         = bool(mdl_cfg.get("pre_message", False)),
+                                    dropout              = float(mdl_cfg.get("dropout", 0.0)),
+                                    self_loops           = bool(mdl_cfg.get("self_loops", True)),
+                                    pre_message          = bool(mdl_cfg.get("pre_message", False)),
+                                    run_ssm_in_step_mode = run_ssm_in_step_mode,
                                     conv_cache          = bool(mdl_cfg.get("conv_cache", False)),
                                     conv_cache_dt_decay = (
                                         float(mdl_cfg["conv_cache_dt_decay"])
@@ -280,8 +289,9 @@ def main():
                             lambda_wr       = float(trn_cfg.get("lambda_wr", 1e-4)),
                             epochs          = int(trn_cfg.get("epochs", 5)),
                             initial_epoch   = int(trn_cfg.get("initial_epoch", 0)),
-                            batch_events    = int(trn_cfg.get("batch_events", 20_000)),
+                            batch_events    = batch_events,
                             accumulate_every     = int(trn_cfg.get("accumulate_every", 1)),
+                            train_neg_sampler    = str(trn_cfg.get("train_neg_sampler", "base")),
                             train_neg_per_pos    = int(trn_cfg.get("train_neg_per_pos", 1)),
                             val_test_neg_per_pos = int(trn_cfg.get("val_test_neg_per_pos", 49)),
                             seed                 = int(trn_cfg.get("seed", 1337)),

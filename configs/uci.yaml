@@ -3,22 +3,23 @@ dataset:
   root: data/
 
 model:
-  hidden: 1024
-  num_heads: 32
+  hidden: 512
+  num_heads: 16
   head_dim: 32          # hidden // num_heads
   state_dim: 16         # SSM state dim per head
   num_layers: 1
   embed_dim: 64
   scorer: mlp
-  commit_alpha: 0.1
+  commit_alpha: 0.999
   time_feat_dim: 8
-  # time_scale: 604800.0  # 7 days in seconds
   time_scale: 338
   edge_gate_hidden: 32
   dropout: 0.3
   self_loops: false
-  pre_message: false      # B0 ablation: feed neighbour summary into the SSM input
-  conv_cache: true       # B  ablation: persistent Mamba-2 conv cache
+  pre_message: false       # B0 ablation: feed neighbour summary into the SSM input
+  run_ssm_in_step_mode: false
+  num_chunks: 4
+  conv_cache: false        # B  ablation: persistent Mamba-2 conv cache
   conv_cache_dt_decay: null
   intra_bucket_seq: false # C  ablation: per-event SSM stepping within each bucket
   conv1d_kernel_size: 24   # Mamba-2 conv kernel width (effective horizon: K * batch_events events; only active when conv_cache=true)
@@ -31,8 +32,8 @@ model:
   pair_recurrence_undirected: false
   pair_recurrence_reset_per_epoch: false
   query_history: true      # bounded scorer-side recent-neighbor history side channel
-  query_history_k: 512
-  query_history_dim: 16
+  query_history_k: 1024
+  query_history_dim: 32
   query_history_tau: 338    # null = fall back to model.time_scale
   query_history_undirected: false
   query_history_reset_per_epoch: false
@@ -46,8 +47,9 @@ trainer:
   loss_fn: bce
   lambda_wr: 0.0
   epochs: 10
-  batch_events: 256
+  batch_events: 32
   accumulate_every: 1
+  train_neg_sampler: base
   train_neg_per_pos: 1
   val_test_neg_per_pos: 1
   seed: 2020
@@ -71,5 +73,5 @@ adaptive_commit:
   exposure_delta0: 0.05
   exposure_cn: 0.0
   lambda_alpha_prior: 1.0e-3
-  lambda_alpha_saturation: 1.0e-4
+  lambda_alpha_saturation: 1.0e-3
   alpha_warmup_epochs: 2

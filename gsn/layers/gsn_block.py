@@ -104,6 +104,8 @@ class GSNBlock(layers.Layer):
                     num_heads: int,
                     head_dim: int,
                     state_dim: int,
+                    sequence_length: int = 1,
+                    num_chunks: int = 1,
                     time_feat_dim: int = 8,
                     time_scale: float = 86400.0,
                     edge_gate_hidden: int = 32,
@@ -125,6 +127,8 @@ class GSNBlock(layers.Layer):
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim)
         self.state_dim = int(state_dim)
+        self.sequence_length = int(sequence_length)
+        self.num_chunks = int(num_chunks)
         self.time_feat_dim = int(time_feat_dim)
         self.time_scale = float(time_scale)
         self.self_loops = bool(self_loops)
@@ -142,8 +146,8 @@ class GSNBlock(layers.Layer):
                                     head_dim = head_dim,
                                     state_dim = state_dim,
                                     d_model = hidden,
-                                    sequence_length = 1,
-                                    num_chunks = 1,
+                                    sequence_length = sequence_length,
+                                    num_chunks = num_chunks,
                                     conv1d_kernel_size = self.conv1d_kernel_size,
                                     name = (f"{name}_mamba2" if name else "mamba2"),
                                 )
@@ -261,20 +265,261 @@ class GSNBlock(layers.Layer):
             x_np = tf.cast(snap.x, tf.float32)           # [N, F_n]
             return tf.concat([x_np, f_deg], axis = -1)     # [N, F_n+2]
         return f_deg                                      # [N, 2]
+
+    def _node_features_sequence(self, snap: Snapshot) -> tf.Tensor:
+        """Build per-step node features for a padded sequence snapshot."""
+        N = snap.num_nodes
+        L = snap.sequence_length
+        src = tf.cast(snap.edge_src, tf.int32)             # [L, E_max]
+        dst = tf.cast(snap.edge_dst, tf.int32)             # [L, E_max]
+        valid = tf.logical_and(src >= 0, dst >= 0)
+
+        E_max = int(np.asarray(snap.edge_src).shape[1])
+        step_ids = tf.repeat(tf.range(L, dtype = tf.int32), E_max)
+        valid_flat = tf.reshape(valid, [-1])
+        src_flat = tf.boolean_mask(tf.reshape(src, [-1]), valid_flat)
+        dst_flat = tf.boolean_mask(tf.reshape(dst, [-1]), valid_flat)
+        step_flat = tf.boolean_mask(step_ids, valid_flat)
+
+        ones = tf.ones(tf.shape(src_flat), dtype = tf.float32)
+        num_segments = L * N
+        deg_out = tf.math.unsorted_segment_sum(
+            ones, step_flat * N + src_flat, num_segments
+        )
+        deg_in = tf.math.unsorted_segment_sum(
+            ones, step_flat * N + dst_flat, num_segments
+        )
+        deg_out = tf.transpose(tf.reshape(deg_out, [L, N]), [1, 0])
+        deg_in = tf.transpose(tf.reshape(deg_in, [L, N]), [1, 0])
+        f_deg = tf.math.log1p(tf.stack([deg_in, deg_out], axis = -1))  # [N, L, 2]
+
+        if snap.x is not None:
+            x_np = tf.cast(snap.x, tf.float32)
+            if x_np.shape.rank == 2:
+                x_np = tf.tile(tf.expand_dims(x_np, axis = 1), [1, L, 1])
+            return tf.concat([x_np, f_deg], axis = -1)     # [N, L, F_n+2]
+        return f_deg                                      # [N, L, 2]
+
+    def _sequence_dt(self, snap: Snapshot, N: int, L: int) -> tf.Tensor:
+        if snap.seq_dt is not None:
+            dt = tf.cast(snap.seq_dt, tf.float32)
+        else:
+            dt = tf.fill([L], tf.cast(snap.dt, tf.float32))
+        return tf.tile(tf.expand_dims(dt, axis = 0), [N, 1])  # [N, L]
+
+    def _sequence_actual_len(self, snap: Snapshot) -> int:
+        actual = int(getattr(snap, "actual_seq_len", snap.sequence_length))
+        return max(0, min(actual, snap.sequence_length))
+
+    def _pre_message_sequence(
+        self,
+        snap: Snapshot,
+        xh: tf.Tensor,
+    ) -> tf.Tensor:
+        """Apply the optional pre-message summary independently per step."""
+        N = snap.num_nodes
+        L = snap.sequence_length
+        pre_messages = []
+        src_np_all = np.asarray(snap.edge_src, dtype = np.int64)
+        dst_np_all = np.asarray(snap.edge_dst, dtype = np.int64)
+
+        for step in range(L):
+            src_np = src_np_all[step]
+            dst_np = dst_np_all[step]
+            valid = np.logical_and(src_np >= 0, dst_np >= 0)
+            src_i = tf.constant(src_np[valid], dtype = tf.int32)
+            dst_i = tf.constant(dst_np[valid], dtype = tf.int32)
+            xh_src = tf.gather(xh[:, step, :], src_i)
+            pre_m = tf.math.unsorted_segment_sum(xh_src, dst_i, N)
+            pre_messages.append(pre_m)
+
+        pre_m_seq = tf.stack(pre_messages, axis = 1)       # [N, L, hidden]
+        return xh + self.g_pre_msg * self.pre_msg_lin(pre_m_seq)
+
+    def _sequence_ssm_step_loop(
+        self,
+        u: tf.Tensor,
+        s_4d: tf.Tensor,
+        actual_len: int,
+        training: Optional[bool],
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Process a short padded sequence exactly, without consuming padding."""
+        h_ssm = None
+        s_running = s_4d
+        for step in range(actual_len):
+            h_ssm, s_running, _ = self.mamba2.step(
+                u[:, step, :],
+                state = s_running,
+                conv_state = None,
+                training = training,
+            )
+        if h_ssm is None:
+            raise ValueError("Sequence snapshots must contain at least one timestep.")
+        return h_ssm, s_running
+
+    def _call_sequence(
+        self,
+        *,
+        snap: Snapshot,
+        s: tf.Tensor,
+        training: Optional[bool] = None,
+    ) -> Tuple[tf.Tensor, tf.Tensor, Optional[tf.Tensor]]:
+        """Forward pass for a padded sequence snapshot."""
+        if not snap.is_sequence:
+            raise ValueError("Sequence mode requires a sequence Snapshot.")
+        if self.intra_bucket_seq:
+            raise RuntimeError("`intra_bucket_seq` is only supported in step mode.")
+
+        N = snap.num_nodes
+        L = snap.sequence_length
+        actual_len = self._sequence_actual_len(snap)
+        if actual_len <= 0:
+            raise ValueError("Sequence snapshots must contain at least one timestep.")
+        if L != self.sequence_length:
+            raise ValueError(
+                f"Sequence snapshot length {L} does not match model sequence_length "
+                f"{self.sequence_length}."
+            )
+
+        x_in = self._node_features_sequence(snap)           # [N, L, F]
+        xh = self.lin_in(x_in)                              # [N, L, hidden]
+        te = self.node_time_enc(self._sequence_dt(snap, N, L))
+        xh = xh + self.lin_time(te)
+
+        if self.pre_message:
+            xh = self._pre_message_sequence(snap, xh)
+
+        u = self.ln1(xh, training = training)               # [N, L, hidden]
+        s_4d = tf.reshape(
+                            tf.cast(s, u.dtype),
+                            [N, self.num_heads, self.head_dim, self.state_dim]
+                         )
+
+        if actual_len == self.sequence_length:
+            s_5d = tf.expand_dims(s_4d, axis = 1)
+            h_seq, s_next_4d = self.mamba2(
+                                            inputs = (u, s_5d),
+                                            training = training
+                                          )
+            h_ssm = h_seq[:, actual_len - 1, :]
+        else:
+            h_ssm, s_next_4d = self._sequence_ssm_step_loop(
+                                                                    u          = u,
+                                                                    s_4d       = s_4d,
+                                                                    actual_len = actual_len,
+                                                                    training   = training,
+                                                                )
+
+        s_next = tf.reshape(s_next_4d, [N, self.state_dim_total])
+        xh_final = xh[:, actual_len - 1, :]
+        out = self._message_passing(
+                                    snap       = snap,
+                                    xh         = xh_final,
+                                    h_ssm      = h_ssm,
+                                    training   = training,
+                                    step_index = actual_len - 1,
+                                  )
+        return out, tf.cast(s_next, tf.float32), None
+
+    def _message_passing(
+        self,
+        snap: Snapshot,
+        xh: tf.Tensor,
+        h_ssm: tf.Tensor,
+        training: Optional[bool],
+        step_index: Optional[int] = None,
+    ) -> tf.Tensor:
+        """Run the gated message-passing/FFN tail on a scalar or sequence step."""
+        N = snap.num_nodes
+        xw = self.msg_lin(h_ssm)            # [N, hidden]
+
+        if snap.is_sequence:
+            if step_index is None:
+                step_index = max(self._sequence_actual_len(snap) - 1, 0)
+            src_np = np.asarray(snap.edge_src[step_index], dtype = np.int64)
+            dst_np = np.asarray(snap.edge_dst[step_index], dtype = np.int64)
+            valid = np.logical_and(src_np >= 0, dst_np >= 0)
+            src_i = tf.constant(src_np[valid], dtype = tf.int32)
+            dst_i = tf.constant(dst_np[valid], dtype = tf.int32)
+            edge_feat = (
+                np.asarray(snap.edge_feat[step_index][valid], dtype = np.float32)
+                if snap.edge_feat is not None
+                else None
+            )
+            edge_ts = (
+                np.asarray(snap.edge_ts[step_index][valid], dtype = np.int64)
+                if snap.edge_ts is not None
+                else None
+            )
+            if snap.seq_t_ref is not None:
+                t_ref_value = float(np.asarray(snap.seq_t_ref)[step_index])
+            else:
+                t_ref_value = float(snap.t_ref)
+        else:
+            src_i = tf.cast(snap.edge_src, tf.int32)
+            dst_i = tf.cast(snap.edge_dst, tf.int32)
+            edge_feat = snap.edge_feat
+            edge_ts = snap.edge_ts
+            t_ref_value = float(snap.t_ref)
+
+        H, d = self.num_heads, self.head_dim
+        xw_hd = tf.reshape(xw, [-1, H, d])          # [N, H, d]
+        hi_hd = tf.gather(xw_hd, src_i)             # [E, H, d]
+
+        hi_flat = tf.reshape(hi_hd, [-1, self.hidden])  # [E, hidden]
+        hj_flat = tf.reshape(
+            tf.gather(xw_hd, dst_i), [-1, self.hidden]
+        )
+        gate_parts = [hi_flat, hj_flat]
+
+        if edge_feat is not None:
+            gate_parts.append(tf.cast(edge_feat, tf.float32))
+
+        if edge_ts is not None:
+            t_ref = tf.cast(t_ref_value, tf.float32)
+            dt_e = tf.maximum(t_ref - tf.cast(edge_ts, tf.float32), 0.0)
+            te_e = self.edge_time_enc(dt_e)
+            gate_parts.append(te_e)
+
+        e_in = tf.concat(gate_parts, axis = -1)
+        g = tf.sigmoid(self.edge_gate(e_in, training = training))  # [E, H]
+
+        g_exp = tf.expand_dims(g, axis = -1)
+        msg_hd = g_exp * hi_hd
+        msg_flat = tf.reshape(msg_hd, [-1, self.hidden])
+
+        if self.self_loops:
+            loop_idx = tf.range(N, dtype = tf.int32)
+            self_msg = tf.reshape(tf.gather(xw_hd, loop_idx), [N, self.hidden])
+            msg_flat = tf.concat([msg_flat, self_msg], axis = 0)
+            dst_agg = tf.concat([dst_i, loop_idx], axis = 0)
+        else:
+            dst_agg = dst_i
+
+        m = tf.math.unsorted_segment_sum(msg_flat, dst_agg, N)
+        v = xh + self.g_ssm * h_ssm + self.g_msg * m
+        return v + self.ffn(self.ln2(v, training = training), training = training)
     
     def __call__(self,
                  *,
                  snap: Snapshot,
                  s: tf.Tensor,
                  conv_s: Optional[tf.Tensor] = None,
-                 training: Optional[bool] = None
+                 training: Optional[bool] = None,
+                 run_step_mode: Optional[bool] = True,
                 ) -> Tuple[tf.Tensor, tf.Tensor, Optional[tf.Tensor]]:
 
         if not self.built:
             self._N = snap.num_nodes
             self.built = True
 
-        return super().__call__(snap = snap, s = s, conv_s = conv_s, training = training)
+        return self.call(
+                            snap          = snap,
+                            s             = s,
+                            conv_s        = conv_s,
+                            training      = training,
+                            run_step_mode = run_step_mode,
+                         )
 
     def call(
                 self,
@@ -283,6 +528,7 @@ class GSNBlock(layers.Layer):
                 s: tf.Tensor,                       # [N, state_dim_total]  float32
                 conv_s: Optional[tf.Tensor] = None, # [N, conv_state_dim_total] float32 or None
                 training: Optional[bool] = None,
+                run_step_mode: Optional[bool] = True
             ) -> Tuple[tf.Tensor, tf.Tensor, Optional[tf.Tensor]]:
         """
         Forward pass for one snapshot.
@@ -295,7 +541,32 @@ class GSNBlock(layers.Layer):
                        updated per-node conv cache, or None when conv_cache
                        is disabled (caller should not commit it).
         """
+        
+        if run_step_mode and snap.is_sequence:
+            raise ValueError("Step mode requires a scalar Snapshot.")
+
+        if run_step_mode and (self.sequence_length != 1 or self.num_chunks != 1):
+            raise AttributeError(
+                                    "Running in step mode requires `sequence_length=1` and `num_chunks=1`. "
+                                    f"Found sequence_length = {self.sequence_length} and num_chunks = {self.num_chunks}."
+                                )
+        
+        if (not run_step_mode) and self.conv_cache:
+            raise RuntimeError(
+                                "`conv_cache` is meant to be used with step mode in order to "
+                                "cache the conv states. If not using step mode then setting "
+                                "`conv_cache` to True is redundant and creates confusion. "
+                                "Re-run using `conv_cache=False`."
+                              )
+         
         N = snap.num_nodes
+
+        if not run_step_mode:
+            return self._call_sequence(
+                                       snap     = snap,
+                                       s        = s,
+                                       training = training,
+                                     )
 
         # 1. Input projection
         x_in = self._node_features(snap)    # [N, F]
@@ -351,17 +622,30 @@ class GSNBlock(layers.Layer):
             # the final per-node SSM output (last-step h_ssm) is what flows
             # into the downstream message-passing / FFN path.
             h_ssm, s_next_4d, conv_s_next_3d = self._intra_bucket_ssm(
-                snap        = snap,
-                xh          = xh,
-                u0          = u,
-                s_4d        = s_4d,
-                conv_s_in   = conv_s_in,
-                training    = training,
-            )
+                                                                        snap          = snap,
+                                                                        xh            = xh,
+                                                                        u0            = u,
+                                                                        s_4d          = s_4d,
+                                                                        conv_s_in     = conv_s_in,
+                                                                        run_step_mode = run_step_mode,
+                                                                        training      = training,
+                                                                     )
         else:
-            h_ssm, s_next_4d, conv_s_next_3d = self.mamba2.step(
-                u, state = s_4d, conv_state = conv_s_in, training = training,
-            )
+            if run_step_mode:
+                h_ssm, s_next_4d, conv_s_next_3d = self.mamba2.step(
+                                                                        u,
+                                                                        state = s_4d,
+                                                                        conv_state = conv_s_in,
+                                                                        training = training
+                                                                    )
+            else:
+                s_5d = tf.expand_dims(s_4d, axis = 1)       # (batch, 1, num_heads, head_dim, state_dim)
+                h_ssm, s_next_4d = self.mamba2(
+                                                inputs = (u, s_5d),
+                                                training = training
+                                              )
+                conv_s_next_3d = None
+               
         # h_ssm: [N, hidden],  s_next_4d: [N, H, P, N_state]
         # conv_s_next_3d: [N, K-1, C] (always returned by step)
         s_next = tf.reshape(s_next_4d, [N, self.state_dim_total])
@@ -369,6 +653,15 @@ class GSNBlock(layers.Layer):
         # Only forward the conv cache to the caller when we intend to persist it.
         conv_s_next: Optional[tf.Tensor] = None
         if self.conv_cache:
+            if conv_s_next_3d is None:
+                conv_s_next = tf.zeros(
+                                        shape = (
+                                                    N,                              # num nodes
+                                                    self.conv1d_kernel_size - 1,    # K - 1
+                                                    self.mamba2.xbc_channels        # H * (2N + P)
+                                                ),
+                                        dtype = tf.float32
+                                      )
             conv_s_next = tf.cast(conv_s_next_3d, tf.float32)   # [N, K-1, C]
 
         # 4. Message passing with edge gates
@@ -435,7 +728,8 @@ class GSNBlock(layers.Layer):
                             u0:        tf.Tensor,                  # [N, hidden] = ln1(xh)
                             s_4d:      tf.Tensor,                  # [N, H, P, N_state]
                             conv_s_in: Optional[tf.Tensor],        # [N, K-1, C] or None
-                            training:  Optional[bool],
+                            run_step_mode: Optional[bool] = False,
+                            training:  Optional[bool] = None
                          ) -> Tuple[tf.Tensor, tf.Tensor, Optional[tf.Tensor]]:
         """
         Run the Mamba-2 SSM as a *sequence* of per-event steps inside a single
@@ -459,16 +753,24 @@ class GSNBlock(layers.Layer):
         # ``conv_s_running`` is always a real tensor we can keep threading
         # through the per-event loop. Whether we *persist* it across buckets
         # is decided by ``self.conv_cache`` at the very end.
-        h_ssm, s_4d, conv_s_running = self.mamba2.step(
-            u0, state = s_4d, conv_state = conv_s_in, training = training,
-        )                                                       # [N, hidden]
+        if run_step_mode:
+            h_ssm, s_4d, conv_s_running = self.mamba2.step(
+                                                            u0,
+                                                            state = s_4d,
+                                                            conv_state = conv_s_in,
+                                                            training = training
+                                                          ) # [N, hidden]
+        else:
+            h_ssm, s_4d = self.mamba2(u0, state = s_4d, training = training)
+            conv_s_running = tf.zeros(
+                                        shape = (N, K - 1, C_chan),
+                                        dtype = tf.float32
+                                      )
 
         # ---- (ii) Per-event steps ----------------------------------------
         E = snap.num_edges
         if E == 0:
-            conv_s_next = (
-                tf.cast(conv_s_running, tf.float32) if self.conv_cache else None
-            )
+            conv_s_next = tf.cast(conv_s_running, tf.float32) if self.conv_cache else None
             return h_ssm, s_4d, conv_s_next
 
         # Build the per-event ordering with numpy (snap is an eager dataclass).
@@ -557,6 +859,8 @@ class GSNBlock(layers.Layer):
                             num_heads           = self.num_heads,
                             head_dim            = self.head_dim,
                             state_dim           = self.state_dim,
+                            sequence_length     = self.sequence_length,
+                            num_chunks          = self.num_chunks,
                             time_feat_dim       = self.time_feat_dim,
                             time_scale          = self.time_scale,
                             self_loops          = self.self_loops,
@@ -647,21 +951,28 @@ class PersistentGSNBlock(layers.Layer):
                  *,
                  snap: Snapshot,
                  commit: bool = False,
-                 training: Optional[bool] = None
+                 training: Optional[bool] = None,
+                 run_step_mode: Optional[bool] = True
                 ) -> Tuple[tf.Tensor, tf.Tensor]:
 
         if not self.built:
             self._N = snap.num_nodes
             self.built = True
 
-        return super().__call__(snap = snap, commit = commit, training = training)
+        return self.call(
+                            snap          = snap,
+                            commit        = commit,
+                            training      = training,
+                            run_step_mode = run_step_mode,
+                         )
 
 
     def call(
                 self,
                 *,
                 snap: Snapshot,
-                commit: bool = False,
+                run_step_mode: Optional[bool] = True,
+                commit: Optional[bool] = False,
                 training: Optional[bool] = None
             ) -> Tuple[tf.Tensor, tf.Tensor]:
         """
@@ -687,8 +998,12 @@ class PersistentGSNBlock(layers.Layer):
             s_in = s_in + tf.random.normal(tf.shape(s_in), stddev = self.noise_scale)
 
         out, s_next, conv_s_next = self.block(
-            snap = snap, s = s_in, conv_s = conv_s_in, training = training,
-        )
+                                                snap = snap,
+                                                s = s_in,
+                                                conv_s = conv_s_in,
+                                                training = training,
+                                                run_step_mode = run_step_mode
+                                              )
 
         if commit:
             if self.adaptive_mode:
@@ -713,9 +1028,13 @@ class PersistentGSNBlock(layers.Layer):
     def _event_count_per_node(self, snap: Snapshot) -> np.ndarray:
         """Return [N] int array: number of edge appearances per local node index."""
         N    = snap.num_nodes
-        ones = np.ones(snap.num_edges, dtype = np.int64)
         src  = np.asarray(snap.edge_src, dtype = np.int64)
         dst  = np.asarray(snap.edge_dst, dtype = np.int64)
+        if src.ndim == 2:
+            valid = np.logical_and(src >= 0, dst >= 0)
+            src = src[valid]
+            dst = dst[valid]
+        ones = np.ones(src.shape[0], dtype = np.int64)
         counts = np.zeros(N, dtype = np.int64)
         np.add.at(counts, src, ones)
         np.add.at(counts, dst, ones)

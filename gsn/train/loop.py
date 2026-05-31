@@ -108,22 +108,28 @@ class GSNLinkPredictor(keras.Model):
 
     def __init__(
                     self,
-                    num_nodes:        int,
-                    hidden:           int   = 128,
-                    num_heads:        int   = 4,
-                    head_dim:         int   = 32,
-                    state_dim:        int   = 16,
-                    num_layers:       int   = 1,
-                    embed_dim:        int   = 128,
-                    scorer:           str   = "mlp",
-                    commit_alpha:     float = 0.2,
-                    time_feat_dim:    int   = 8,
-                    time_scale:       float = 86400.0,
-                    edge_gate_hidden: int   = 32,
-                    dropout:          float = 0.0,
-                    self_loops:       bool  = True,
-                    pre_message:      bool  = False,
-                    conv_cache:       bool  = False,
+                    num_nodes:            int,
+                    hidden:               int   = 128,
+                    num_heads:            int   = 4,
+                    head_dim:             int   = 32,
+                    state_dim:            int   = 16,
+                    sequence_length:      int   = 1,
+                    num_chunks:           int   = 1,
+                    num_layers:           int   = 1,
+                    embed_dim:            int   = 128,
+                    scorer:               str   = "mlp",
+                    commit_alpha:         float = 0.2,
+                    time_feat_dim:        int   = 8,
+                    time_scale:           float = 86400.0,
+                    edge_gate_hidden:     int   = 32,
+                    dropout:              float = 0.0,
+                    self_loops:           bool  = True,
+                    pre_message:          bool  = False,
+                    run_ssm_in_step_mode: bool = True,      # whether to do the forward pass in one shot over the entire sequence
+                                                            # or to to it one-step at a time for L steps; L is seq. length.
+                                                            
+                    conv_cache:           bool  = False,    # if using step mode, then setting this flag dictates whether the conv
+                                                            # cache is propagated or initialized afresh every time.
                     conv_cache_dt_decay: Optional[float] = None,
                     intra_bucket_seq: bool  = False,
                     conv1d_kernel_size: int = 4,
@@ -142,10 +148,6 @@ class GSNLinkPredictor(keras.Model):
                     query_history_undirected: bool = True,
                     query_history_reset_per_epoch: bool = True,
                     # ---- Adaptive commit parameters ----
-                    # commit_mode: "uniform" (default) or "adaptive_hazard"
-                    # These mirror the adaptive_commit: section in the YAML config.
-                    # When commit_mode="uniform" everything below is ignored and the
-                    # model behaves exactly as before.
                     commit_mode:      str   = "uniform",
                     gate_hidden:      int   = 64,
                     gate_layers:      int   = 2,
@@ -165,6 +167,8 @@ class GSNLinkPredictor(keras.Model):
         self._num_heads        = int(num_heads)
         self._head_dim         = int(head_dim)
         self._state_dim        = int(state_dim)
+        self._sequence_length  = int(sequence_length)
+        self._num_chunks       = int(num_chunks)
         self._num_layers       = int(num_layers)
         self._embed_dim        = int(embed_dim)
         self._scorer           = str(scorer)
@@ -175,6 +179,7 @@ class GSNLinkPredictor(keras.Model):
         self._dropout          = float(dropout)
         self._self_loops       = bool(self_loops)
         self._pre_message      = bool(pre_message)
+        self._step_mode        = bool(run_ssm_in_step_mode)
         self._conv_cache       = bool(conv_cache)
         self._conv_cache_dt_decay = (
             float(conv_cache_dt_decay) if conv_cache_dt_decay else None
@@ -198,6 +203,25 @@ class GSNLinkPredictor(keras.Model):
         )
         self._query_history_undirected = bool(query_history_undirected)
         self._query_history_reset_per_epoch = bool(query_history_reset_per_epoch)
+
+        if self._step_mode:
+            self._sequence_length = 1
+            self._num_chunks = 1
+        if self._sequence_length <= 0:
+            raise ValueError("sequence_length must be positive.")
+        if self._num_chunks <= 0:
+            raise ValueError("num_chunks must be positive.")
+        if self._sequence_length % self._num_chunks != 0:
+            raise ValueError(
+                f"sequence_length = {self._sequence_length} must be divisible "
+                f"by num_chunks = {self._num_chunks}."
+            )
+        if not self._step_mode:
+            if self._conv_cache:
+                raise ValueError("conv_cache is only supported when run_ssm_in_step_mode = true.")
+            if self._intra_bucket_seq:
+                raise ValueError("intra_bucket_seq is only supported when run_ssm_in_step_mode = true.")
+
         # Adaptive commit
         self._commit_mode      = str(commit_mode)
         self._gate_hidden      = int(gate_hidden)
@@ -276,6 +300,8 @@ class GSNLinkPredictor(keras.Model):
                                 num_heads           = self._num_heads,
                                 head_dim            = self._head_dim,
                                 state_dim           = self._state_dim,
+                                sequence_length     = self._sequence_length,
+                                num_chunks          = self._num_chunks,
                                 time_feat_dim       = self._time_feat_dim,
                                 time_scale          = self._time_scale,
                                 edge_gate_hidden    = self._edge_gate_hidden,
@@ -370,48 +396,51 @@ class GSNLinkPredictor(keras.Model):
 
     def get_config(self) -> Dict[str, Any]:
         return {
-                    "num_nodes":        self.num_nodes,
-                    "hidden":           self.hidden,
-                    "num_heads":        self._num_heads,
-                    "head_dim":         self._head_dim,
-                    "state_dim":        self._state_dim,
-                    "num_layers":       self._num_layers,
-                    "embed_dim":        self._embed_dim,
-                    "scorer":           self._scorer,
-                    "commit_alpha":     self._commit_alpha,
-                    "time_feat_dim":    self._time_feat_dim,
-                    "time_scale":       self._time_scale,
-                    "edge_gate_hidden": self._edge_gate_hidden,
-                    "dropout":          self._dropout,
-                    "self_loops":       self._self_loops,
-                    "pre_message":      self._pre_message,
-                    "conv_cache":       self._conv_cache,
-                    "conv_cache_dt_decay": self._conv_cache_dt_decay,
-                    "intra_bucket_seq": self._intra_bucket_seq,
-                    "conv1d_kernel_size": self._conv1d_kernel_size,
-                    "noise_scale":      self._noise_scale,
-                    "id_dim":           self._id_dim,
-                    "temp":             float(self.temp.numpy()),
-                    "pair_recurrence":  self._pair_recurrence,
-                    "pair_recurrence_dim": self._pair_recurrence_dim,
-                    "pair_recurrence_tau": self._pair_recurrence_tau,
-                    "pair_recurrence_undirected": self._pair_recurrence_undirected,
-                    "pair_recurrence_reset_per_epoch": self._pair_recurrence_reset_per_epoch,
-                    "query_history": self._query_history,
-                    "query_history_k": self._query_history_k,
-                    "query_history_dim": self._query_history_dim,
-                    "query_history_tau": self._query_history_tau,
-                    "query_history_undirected": self._query_history_undirected,
-                    "query_history_reset_per_epoch": self._query_history_reset_per_epoch,
-                    # Adaptive commit (safe to include; ignored when commit_mode="uniform")
-                    "commit_mode":      self._commit_mode,
-                    "gate_hidden":      self._gate_hidden,
-                    "gate_layers":      self._gate_layers,
-                    "alpha_min":        self._alpha_min,
-                    "alpha_max":        self._alpha_max,
-                    "lambda_min":       self._lambda_min,
-                    "exposure_delta0":  self._exposure_delta0,
-                    "exposure_cn":      self._exposure_cn,
+                    "num_nodes"             : self.num_nodes,
+                    "hidden"                : self.hidden,
+                    "num_heads"             : self._num_heads,
+                    "head_dim"              : self._head_dim,
+                    "state_dim"             : self._state_dim,
+                    "sequence_length"       : self._sequence_length,
+                    "num_chunks"            : self._num_chunks,
+                    "num_layers"            : self._num_layers,
+                    "embed_dim"             : self._embed_dim,
+                    "scorer"                : self._scorer,
+                    "commit_alpha"          : self._commit_alpha,
+                    "time_feat_dim"         : self._time_feat_dim,
+                    "time_scale"            : self._time_scale,
+                    "edge_gate_hidden"      : self._edge_gate_hidden,
+                    "dropout"               : self._dropout,
+                    "self_loops"            : self._self_loops,
+                    "pre_message"           : self._pre_message,
+                    "run_ssm_in_step_mode"  : self._step_mode,
+                    "conv_cache"            : self._conv_cache,
+                    "conv_cache_dt_decay"   : self._conv_cache_dt_decay,
+                    "intra_bucket_seq"      : self._intra_bucket_seq,
+                    "conv1d_kernel_size"    : self._conv1d_kernel_size,
+                    "noise_scale"           : self._noise_scale,
+                    "id_dim"                : self._id_dim,
+                    "temp"                  : float(self.temp.numpy()),
+                    "pair_recurrence"       : self._pair_recurrence,
+                    "pair_recurrence_dim"   : self._pair_recurrence_dim,
+                    "pair_recurrence_tau"   : self._pair_recurrence_tau,
+                    "pair_recurrence_undirected"       : self._pair_recurrence_undirected,
+                    "pair_recurrence_reset_per_epoch"  : self._pair_recurrence_reset_per_epoch,
+                    "query_history"                    : self._query_history,
+                    "query_history_k"                  : self._query_history_k,
+                    "query_history_dim"                : self._query_history_dim,
+                    "query_history_tau"                : self._query_history_tau,
+                    "query_history_undirected"         : self._query_history_undirected,
+                    "query_history_reset_per_epoch"    : self._query_history_reset_per_epoch,
+                    # Adaptive commit
+                    "commit_mode"                      : self._commit_mode,
+                    "gate_hidden"                      : self._gate_hidden,
+                    "gate_layers"                      : self._gate_layers,
+                    "alpha_min"                        : self._alpha_min,
+                    "alpha_max"                        : self._alpha_max,
+                    "lambda_min"                       : self._lambda_min,
+                    "exposure_delta0"                  : self._exposure_delta0,
+                    "exposure_cn"                      : self._exposure_cn
                 }
 
     def _build_from_dummy(self, edge_feat_dim: int = None) -> None:
@@ -458,6 +487,11 @@ class GSNLinkPredictor(keras.Model):
                                                         if edge_feat_dim is not None else None
                                                      ),
                                     )
+        if not self._step_mode:
+            dummy = Snapshot.concatenate(
+                                        [dummy],
+                                        seq_len = self._sequence_length,
+                                      )
         H, states = self.forward(dummy, commit = False, training = False)
 
         dummy_src = np.asarray([0, 0], dtype = np.int64)
@@ -908,6 +942,8 @@ class GSNLinkPredictor(keras.Model):
             
     def build(self, input_shape = None):
         self.built = True
+        if input_shape is None:
+            return
         super().build(input_shape)
             
     def call(
@@ -937,7 +973,7 @@ class GSNLinkPredictor(keras.Model):
         out        = None
         all_states = []
         for pblock in self.blocks:
-            h, s_next = pblock(snap = snap, commit = commit, training = training)
+            h, s_next = pblock(snap = snap, commit = commit, training = training, run_step_mode = self._step_mode)
             out = h
             all_states.append(s_next)
         return out, all_states
@@ -1295,6 +1331,119 @@ def _build_pre_snapshot(
                   )
 
 
+def _empty_snapshot(
+                       node_ids:               np.ndarray,
+                       t_ref:                  int,
+                       last_t:                 int,
+                       edge_feat_template:     Optional[np.ndarray] = None,
+                   ) -> Snapshot:
+    node_ids = np.asarray(node_ids, dtype = np.int64).reshape(-1)
+    edge_feat = None
+    if edge_feat_template is not None:
+        tpl = np.asarray(edge_feat_template)
+        if tpl.ndim == 2 and tpl.shape[1] > 0:
+            edge_feat = np.empty((0, int(tpl.shape[1])), dtype = tpl.dtype)
+
+    return Snapshot(
+                   node_ids  = np.unique(node_ids).astype(np.int64),
+                   edge_src  = np.empty(0, dtype = np.int32),
+                   edge_dst  = np.empty(0, dtype = np.int32),
+                   num_nodes = int(np.unique(node_ids).shape[0]),
+                   t_ref     = int(t_ref),
+                   dt        = max(float(t_ref - last_t), 1.0),
+                   edge_feat = edge_feat,
+                   edge_ts   = np.empty(0, dtype = np.int64),
+                   x         = None,
+                  )
+
+
+def _build_sequence_snapshot(
+                               src:                np.ndarray,
+                               dst:                np.ndarray,
+                               ts:                 np.ndarray,
+                               edge_feat:          Optional[np.ndarray],
+                               t_ref:              int,
+                               last_t:             int,
+                               seq_len:            int,
+                               extra_node_ids:     Optional[np.ndarray] = None,
+                               edge_feat_template: Optional[np.ndarray] = None,
+                           ) -> Optional[Snapshot]:
+    src = np.asarray(src, dtype = np.int64).reshape(-1)
+    dst = np.asarray(dst, dtype = np.int64).reshape(-1)
+    ts  = np.asarray(ts,  dtype = np.int64).reshape(-1)
+    if src.shape[0] > seq_len:
+        raise ValueError(
+            f"Cannot build a sequence snapshot with {src.shape[0]} events "
+            f"and seq_len = {seq_len}."
+        )
+
+    extra = (
+                np.asarray(extra_node_ids, dtype = np.int64).reshape(-1)
+                if extra_node_ids is not None else np.empty(0, dtype = np.int64)
+            )
+
+    if src.shape[0] == 0:
+        if extra.size == 0:
+            return None
+        empty = _empty_snapshot(
+                               node_ids           = extra,
+                               t_ref              = t_ref,
+                               last_t             = last_t,
+                               edge_feat_template = edge_feat_template,
+                             )
+        return Snapshot.concatenate([empty], seq_len = seq_len)
+
+    snapshots = []
+    prev_t = int(last_t)
+    for i in range(src.shape[0]):
+        ti = int(ts[i])
+        ef_i = None if edge_feat is None else np.asarray(edge_feat)[i : i + 1]
+        snapshots.append(
+            Snapshot.from_events(
+                               src_global = src[i : i + 1],
+                               dst_global = dst[i : i + 1],
+                               timestamps = ts[i : i + 1],
+                               t_ref      = ti,
+                               dt         = max(float(ti - prev_t), 1.0),
+                               edge_feat  = ef_i,
+                             )
+        )
+        prev_t = ti
+
+    snap = Snapshot.concatenate(
+                               snapshots,
+                               seq_len        = seq_len,
+                               extra_node_ids = extra,
+                             )
+    snap.t_ref = int(t_ref)
+    snap.dt = max(float(t_ref - last_t), 1.0)
+    return snap
+
+
+def _build_pre_sequence_snapshot(
+                                   prev_src:           np.ndarray,
+                                   prev_dst:           np.ndarray,
+                                   prev_ts:            np.ndarray,
+                                   prev_edge_feat:     Optional[np.ndarray],
+                                   extra_node_ids:     np.ndarray,
+                                   t_ref:              int,
+                                   last_t:             int,
+                                   seq_len:            int,
+                                   edge_feat_template: Optional[np.ndarray] = None,
+                               ) -> Optional[Snapshot]:
+    return _build_sequence_snapshot(
+                                   src                = prev_src,
+                                   dst                = prev_dst,
+                                   ts                 = prev_ts,
+                                   edge_feat          = prev_edge_feat,
+                                   t_ref              = t_ref,
+                                   last_t             = last_t,
+                                   seq_len            = seq_len,
+                                   extra_node_ids     = extra_node_ids,
+                                   edge_feat_template = edge_feat_template,
+                                 )
+
+
 # ---------------------------------------------------------------------------
 # Trainer config
 # ---------------------------------------------------------------------------
@@ -1312,6 +1461,7 @@ class TrainerConfig:
     initial_epoch:    int            = 0
     batch_events:     int            = 20_000
     accumulate_every: int            = 1
+    train_neg_sampler: str           = "base"
     train_neg_per_pos:    int            = 1
     val_test_neg_per_pos: int            = 49   # -1 = all negatives (requires precomputed neg_dst)
     seed:             int            = 1337
@@ -1363,23 +1513,63 @@ class Trainer(keras.Model):
         # define inductive-NSS cutoffs so they match the standalone evaluator.
         self._eval_train = eval_train if eval_train is not None else train
 
-        self._gsn_optimizer = keras.optimizers.AdamW(
-                                                        learning_rate = cfg.lr,
-                                                        beta_1        = cfg.beta_1,
-                                                        beta_2        = cfg.beta_2,
-                                                        weight_decay  = cfg.weight_decay
-                                                    )
+        if not self.model._step_mode:
+            if cfg.batch_events <= 0:
+                raise ValueError(
+                    "Sequence mode requires trainer.batch_events to be a positive "
+                    "fixed sequence length."
+                )
+            if int(cfg.batch_events) != int(self.model._sequence_length):
+                raise ValueError(
+                    f"trainer.batch_events = {cfg.batch_events} must match "
+                    f"model.sequence_length = {self.model._sequence_length} "
+                    "when run_ssm_in_step_mode = false."
+                )
+
+        AdamW = getattr(keras.optimizers, "AdamW", None)
+        if AdamW is None and hasattr(keras.optimizers, "experimental"):
+            AdamW = getattr(keras.optimizers.experimental, "AdamW", None)
+        if AdamW is not None:
+            self._gsn_optimizer = AdamW(
+                                            learning_rate = cfg.lr,
+                                            beta_1        = cfg.beta_1,
+                                            beta_2        = cfg.beta_2,
+                                            weight_decay  = cfg.weight_decay,
+                                        )
+        else:
+            if float(cfg.weight_decay) != 0.0:
+                raise RuntimeError(
+                    "This TensorFlow/Keras build does not provide AdamW; "
+                    "set trainer.weight_decay = 0.0 or install TensorFlow >= 2.15."
+                )
+            self._gsn_optimizer = keras.optimizers.Adam(
+                                                            learning_rate = cfg.lr,
+                                                            beta_1        = cfg.beta_1,
+                                                            beta_2        = cfg.beta_2,
+                                                        )
 
         dst_cands = np.unique(train.dst) if meta.get("bipartite", False) else None
-        self.neg_sampler = TGBStyleTrainNegativeSampler(
-                                                            train_src      = train.src,
-                                                            train_dst      = train.dst,
-                                                            train_ts       = train.ts,
-                                                            num_nodes      = model.num_nodes,
-                                                            num_neg_e      = cfg.train_neg_per_pos,
-                                                            seed           = cfg.seed,
-                                                            dst_candidates = dst_cands
-                                                        )
+        
+        if cfg.train_neg_sampler == "tgb-style":
+            self.neg_sampler = TGBStyleTrainNegativeSampler(
+                                                                train_src      = train.src,
+                                                                train_dst      = train.dst,
+                                                                train_ts       = train.ts,
+                                                                num_nodes      = model.num_nodes,
+                                                                num_neg_e      = cfg.train_neg_per_pos,
+                                                                seed           = cfg.seed,
+                                                                dst_candidates = dst_cands
+                                                            )
+        elif cfg.train_neg_sampler == "base":
+            self.neg_sampler = TrainNegativeSampler(
+                                                        num_nodes = model.num_nodes,
+                                                        neg_per_pos = cfg.train_neg_per_pos,
+                                                        seed = cfg.seed,
+                                                        dst_pool = dst_cands
+                                                    )
+        else:
+            raise AttributeError(f"Invalid Train Negative Sampler: {cfg.train_neg_sampler}. "
+                                 "Valid samplers are: 'tgb-style' or 'base'.")
 
         # ------------------------------------------------------------------
         # DyGLib / DyGMamba-aligned eval samplers (1 neg / pos).
@@ -1396,21 +1586,18 @@ class Trainer(keras.Model):
         # contains the same `extras` set as the standalone (otherwise scores
         # diverge by a few thousandths).
         # ------------------------------------------------------------------
-        from gsn.train.eval import (
-            DyGLibRandomNegativeSampler,
-            DyGLibInductiveNegativeSampler,
-        )
+        from gsn.train.eval import DyGLibRandomNegativeSampler, DyGLibInductiveNegativeSampler
         eval_train = self._eval_train
         full_src = np.concatenate([
-            eval_train.src.astype(np.int64),
-            val.src.astype(np.int64),
-            test.src.astype(np.int64),
-        ])
+                                    eval_train.src.astype(np.int64),
+                                    val.src.astype(np.int64),
+                                    test.src.astype(np.int64)
+                                  ])
         full_dst = np.concatenate([
-            eval_train.dst.astype(np.int64),
-            val.dst.astype(np.int64),
-            test.dst.astype(np.int64),
-        ])
+                                    eval_train.dst.astype(np.int64),
+                                    val.dst.astype(np.int64),
+                                    test.dst.astype(np.int64)
+                                  ])
         full_ts  = np.concatenate([eval_train.ts, val.ts, test.ts])
         random_dst_pool = np.unique(full_dst).astype(np.int64)
 
@@ -1419,19 +1606,19 @@ class Trainer(keras.Model):
         self.val_random_sampler  = DyGLibRandomNegativeSampler(random_dst_pool, seed = val_seed)
         self.test_random_sampler = DyGLibRandomNegativeSampler(random_dst_pool, seed = test_seed)
         self.val_inductive_sampler = DyGLibInductiveNegativeSampler(
-                                            full_src           = full_src,
-                                            full_dst           = full_dst,
-                                            full_ts            = full_ts,
-                                            last_observed_time = float(eval_train.ts[-1]),
-                                            seed               = val_seed,
-                                        )
+                                                                        full_src           = full_src,
+                                                                        full_dst           = full_dst,
+                                                                        full_ts            = full_ts,
+                                                                        last_observed_time = float(eval_train.ts[-1]),
+                                                                        seed               = val_seed,
+                                                                    )
         self.test_inductive_sampler = DyGLibInductiveNegativeSampler(
-                                            full_src           = full_src,
-                                            full_dst           = full_dst,
-                                            full_ts            = full_ts,
-                                            last_observed_time = float(val.ts[-1]),
-                                            seed               = test_seed,
-                                        )
+                                                                        full_src           = full_src,
+                                                                        full_dst           = full_dst,
+                                                                        full_ts            = full_ts,
+                                                                        last_observed_time = float(val.ts[-1]),
+                                                                        seed               = test_seed,
+                                                                    )
 
         self._accum_grads: Optional[List[tf.Tensor]] = None
         self._accum_count  = 0
@@ -1441,9 +1628,7 @@ class Trainer(keras.Model):
         # `None` at the top of every phase (train epoch, val pass, test pass)
         # so the first bucket of each phase has an edge-less pre-snapshot.
         # See `_build_pre_snapshot` for the protocol.
-        self._prev_bucket: Optional[
-                                Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]
-                           ] = None
+        self._prev_bucket: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = None
 
         # ------------------------------------------------------------------
         # Adaptive commit initialisation
@@ -1451,9 +1636,9 @@ class Trainer(keras.Model):
         if model.has_adaptive_commit:
             tau_data, beta = self._compute_tau_and_beta(train)
             cprint(
-                f"[Adaptive commit] tau_data={tau_data:.4g}  beta={beta:.4g}",
-                "cyan",
-            )
+                    f"[Adaptive commit] tau_data={tau_data:.4g}  beta={beta:.4g}",
+                    "cyan",
+                  )
             # setup_adaptive_commit is deferred to fit() so the dummy build
             # (which creates the gate's Dense weights) has already run by then.
             self._pending_tau_data = float(tau_data)
@@ -1565,16 +1750,31 @@ class Trainer(keras.Model):
                                        np.asarray(cand_dst, dtype = np.int64).reshape(-1),
                                   ])
 
-        snap_pre = _build_pre_snapshot(
-                                            prev_src, prev_dst, prev_ts, prev_ef,
-                                            extra_ids, t_end, last_t,
-                                            edge_feat_template = ef_b,
-                                      )
+        if self.model._step_mode:
+            snap_pre = _build_pre_snapshot(
+                                                prev_src, prev_dst, prev_ts, prev_ef,
+                                                extra_ids, t_end, last_t,
+                                                edge_feat_template = ef_b,
+                                          )
+        else:
+            snap_pre = _build_pre_sequence_snapshot(
+                                                        prev_src, prev_dst, prev_ts, prev_ef,
+                                                        extra_ids, t_end, last_t,
+                                                        seq_len = self.model._sequence_length,
+                                                        edge_feat_template = ef_b,
+                                                  )
         if snap_pre is None:
             return {}
 
         # 3. End-bucket snapshot: used ONLY for the commit forward pass.
-        snap_end = _build_snapshot(src_b, dst_b, ts_b, ef_b, t_end, last_t)
+        if self.model._step_mode:
+            snap_end = _build_snapshot(src_b, dst_b, ts_b, ef_b, t_end, last_t)
+        else:
+            snap_end = _build_sequence_snapshot(
+                                                    src_b, dst_b, ts_b, ef_b,
+                                                    t_end, last_t,
+                                                    seq_len = self.model._sequence_length,
+                                                 )
         if snap_end is None:
             return {}
 
@@ -1721,11 +1921,12 @@ class Trainer(keras.Model):
             self._pending_tau_data = None
             self._pending_beta     = None
 
+        self.model.reset_states_all(
+                                        reset_pair_recurrence = self.model.pair_recurrence_reset_per_epoch,
+                                        reset_query_history = self.model.query_history_reset_per_epoch
+                                    )
+        
         for epoch in range(n_initial_epoch, n_epochs):
-            self.model.reset_states_all(
-                reset_pair_recurrence = self.model.pair_recurrence_reset_per_epoch,
-                reset_query_history = self.model.query_history_reset_per_epoch,
-            )
             console.rule(f"[bold white]Epoch {epoch + 1} / {n_epochs}")
 
             # Warmup: linearly ramp gate influence from 0 → 1 over warmup_epochs

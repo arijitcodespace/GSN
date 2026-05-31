@@ -17,6 +17,8 @@ model:
   dropout: 0.0
   self_loops: false
   pre_message: false       # B0 ablation: feed neighbour summary into the SSM input
+  run_ssm_in_step_mode: true
+  num_chunks: 32
   conv_cache: false        # B  ablation: persistent Mamba-2 conv cache
   conv_cache_dt_decay: null  # optional: bucket-Δt decay τ for the conv cache
   intra_bucket_seq: false  # C  ablation: per-event SSM stepping within each bucket
@@ -28,13 +30,13 @@ model:
   pair_recurrence_dim: 16
   pair_recurrence_tau: null  # null = fall back to model.time_scale
   pair_recurrence_undirected: false
-  pair_recurrence_reset_per_epoch: false
-  query_history: true      # bounded scorer-side recent-neighbor history side channel
-  query_history_k: 512
+  pair_recurrence_reset_per_epoch: true
+  query_history: false       # bounded scorer-side recent-neighbor history side channel
+  query_history_k: 16
   query_history_dim: 16
   query_history_tau: null    # null = fall back to model.time_scale
-  query_history_undirected: false
-  query_history_reset_per_epoch: false
+  query_history_undirected: true
+  query_history_reset_per_epoch: true
 
 trainer:
   lr: 1.0e-4
@@ -48,6 +50,7 @@ trainer:
   initial_epoch: 21
   batch_events: 2048
   accumulate_every: 1
+  train_neg_sampler: base
   train_neg_per_pos: 1
   val_test_neg_per_pos: 1
   seed: 2020
@@ -61,7 +64,7 @@ trainer:
 # experimental target for closing the −4.82 AP gap vs DyGMamba.
 # ---------------------------------------------------------------------------
 adaptive_commit:
-  commit_mode: uniform          # "uniform" = constant commit | "adaptive_hazard" = learned gate
+  commit_mode: adaptive_hazard          # "uniform" = constant commit | "adaptive_hazard" = learned gate
   gate_hidden: 64
   gate_layers: 2
   alpha_min: 1.0e-4

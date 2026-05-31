@@ -51,8 +51,9 @@ class Mamba2SSD(layers.Layer):
         H, P, N = self.num_heads, self.head_dim, self.state_dim
         return H * (2 * N + P)
         
-    def build(self, input_shape: Tuple[int, int, int]):
-        _, length, dim = input_shape
+    def build(self, input_shape: Tuple[Tuple[int, int, int], Tuple[int, int, int, int, int]]):
+        _, length, dim = input_shape[0]             # input sequence
+        _, _one, _H, _P, _N  = input_shape[1]       # initial state
         
         if length != self.sequence_length:
             raise ShapeError(f"[Mamba2SSD] Expected dimension 1 (zero-based) of input to have shape "
@@ -62,6 +63,19 @@ class Mamba2SSD(layers.Layer):
                              f"{self.d_model}. Found input_shape = {input_shape}.")
             
         H, P, N = self.num_heads, self.head_dim, self.state_dim
+        
+        if _one != 1:
+            raise ShapeError(f"[Mamba2SSD] Expected dimension 1 (zero-based) of input to have shape "
+                             f"1. Found {_one}.")
+        if _H != H:
+            raise ShapeError(f"[Mamba2SSD] Expected dimension 2 (zero-based) of input to have shape "
+                             f"{H}. Found {_H}.")
+        if _P != P:
+            raise ShapeError(f"[Mamba2SSD] Expected dimention 3 (zero-based) if input to have shape "
+                             f"{P}. Found {_P}.")
+        if _N != N:
+            raise ShapeError(f"[Mamba2SSD] Expected dimention 4 (zero-based) if input to have shape "
+                             f"{N}. Found {_N}.")
         
         self._ip_proj_mat = self.add_weight(name = f"{self.prefix}ip_projection_matrix",
                                             shape = (self.d_model, H * (2 * N + 2 * P + 1)),
@@ -93,13 +107,29 @@ class Mamba2SSD(layers.Layer):
         
         super().build(input_shape)
         
-    def call(self, u: tf.Tensor, training: Optional[bool] = None):
+    def call(
+                self,
+                inputs,
+                training: Optional[bool] = None
+             ):
+        """
+        Args:
+            inputs:
+                u:          [batch, seq_len, d_model]          – **entire** sequence
+                state:      [batch, 1, H, P, N] or None        – previous SSM state (zeros if None)
+
+        Returns:
+            y:               [batch, d_model]
+            new_state:       [batch, H, P, N]
+        """
+        u, state = inputs[0], inputs[1]
         H, P, N = self.num_heads, self.head_dim, self.state_dim
         dtype = u.dtype
         u = tf.cast(u, self.variable_dtype)
         projected = einsum(u, self._ip_proj_mat, "b l di, di do-> b l do")
         projected = tf.cast(projected, self.compute_dtype)
-        A, XBC, Z = tf.split(projected, num_or_size_splits = [H, H * (2*N + P), H * P], axis = -1)
+        A, XBC, Z = tf.split(projected, num_or_size_splits = [H, H * (2 * N + P), H * P], axis = -1)
+        A = -tf.nn.softplus(A)
         z = tf.nn.silu(Z)
         XBC = tf.pad(
                         XBC,
@@ -116,12 +146,15 @@ class Mamba2SSD(layers.Layer):
         B = rearrange(B, "b l (h n) -> b l h n", h = H)
         C = rearrange(C, "b l (h n) -> b l h n", h = H)
 
-        Y_ssm, final_state = self.ssd(X, A, B, C, initial_states = None, training = training)
+        Y_ssm, final_state = self.ssd(X, A, B, C, initial_states = state, training = training)
         Y_ssm = rearrange(Y_ssm, "b l h p -> b l (h p)", h = H)
         Y_ssm = self.norm(Y_ssm, training = training)
         gate = tf.multiply(Y_ssm, z)      # (B, L, H * P)
         y = einsum(gate, self._op_proj_mat, "b l d_inner, d_inner d_model -> b l d_model")
-        return tf.cast(y, dtype)
+        return (
+                    tf.cast(y, dtype),    # (batch, d_model)
+                    final_state           # (batch, H, P, N)
+                )
 
     def step(self, u: tf.Tensor, state: Optional[tf.Tensor] = None,
              conv_state: Optional[tf.Tensor] = None,
@@ -151,8 +184,16 @@ class Mamba2SSD(layers.Layer):
         """
         if not self.built:
             # Trigger weight creation via a dummy sequence-of-1 forward pass
-            dummy = tf.zeros([1, self.sequence_length, self.d_model],
-                             dtype=self.variable_dtype)
+            dummy = (
+                        tf.zeros(
+                                    [1, self.sequence_length, self.d_model],
+                                    dtype = self.variable_dtype
+                                ),
+                        tf.zeros(
+                                    [1, 1, self.num_heads, self.head_dim, self.state_dim],
+                                    dtype = self.variable_dtype
+                                )
+                    )
             self(dummy, training = False)
 
         H, P, N = self.num_heads, self.head_dim, self.state_dim

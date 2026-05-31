@@ -49,7 +49,9 @@ from rich.progress import (
 from gsn.train.loop import (  # noqa: E402  (after rich imports, intentional)
     _iter_buckets,
     _build_pre_snapshot,
+    _build_pre_sequence_snapshot,
     _build_snapshot,
+    _build_sequence_snapshot,
 )
 
 
@@ -356,6 +358,19 @@ def evaluate_split(
     if inductive_sampler is not None:
         inductive_sampler.reset_random_state()
 
+    if not model._step_mode:
+        if batch_events <= 0:
+            raise ValueError(
+                "Sequence mode requires batch_events to be a positive fixed "
+                "sequence length."
+            )
+        if int(batch_events) != int(model._sequence_length):
+            raise ValueError(
+                f"batch_events = {batch_events} must match checkpoint "
+                f"sequence_length = {model._sequence_length} when "
+                "run_ssm_in_step_mode = false."
+            )
+
     buckets      = list(_iter_buckets(split, batch_events))
     n_buckets    = len(buckets)
     total_events = int(split.src.shape[0])
@@ -393,38 +408,51 @@ def evaluate_split(
             if prev_bucket is not None:
                 prev_src, prev_dst, prev_ts, prev_ef = prev_bucket
             else:
-                prev_src = np.empty(0, dtype=np.int64)
-                prev_dst = np.empty(0, dtype=np.int64)
-                prev_ts  = np.empty(0, dtype=np.int64)
+                prev_src = np.empty(0, dtype = np.int64)
+                prev_dst = np.empty(0, dtype = np.int64)
+                prev_ts  = np.empty(0, dtype = np.int64)
                 prev_ef  = None
 
             extras = [
-                np.asarray(src_b,        dtype=np.int64).reshape(-1),
-                np.asarray(dst_b,        dtype=np.int64).reshape(-1),
-                np.asarray(rnd_neg_src,  dtype=np.int64).reshape(-1),
-                np.asarray(rnd_neg_dst,  dtype=np.int64).reshape(-1),
+                np.asarray(src_b,        dtype = np.int64).reshape(-1),
+                np.asarray(dst_b,        dtype = np.int64).reshape(-1),
+                np.asarray(rnd_neg_src,  dtype = np.int64).reshape(-1),
+                np.asarray(rnd_neg_dst,  dtype = np.int64).reshape(-1),
             ]
             if ind_neg_src is not None and ind_neg_dst is not None:
                 extras.extend([
-                    np.asarray(ind_neg_src, dtype=np.int64).reshape(-1),
-                    np.asarray(ind_neg_dst, dtype=np.int64).reshape(-1),
+                    np.asarray(ind_neg_src, dtype = np.int64).reshape(-1),
+                    np.asarray(ind_neg_dst, dtype = np.int64).reshape(-1),
                 ])
             extra_ids = np.concatenate(extras)
 
-            snap_pre = _build_pre_snapshot(
-                prev_src, prev_dst, prev_ts, prev_ef,
-                extra_ids, t_end_int, last_t,
-                edge_feat_template=ef_b,
-            )
-            snap_end = _build_snapshot(src_b, dst_b, ts_b, ef_b, t_end_int, last_t)
+            if model._step_mode:
+                snap_pre = _build_pre_snapshot(
+                                                prev_src, prev_dst, prev_ts, prev_ef,
+                                                extra_ids, t_end_int, last_t,
+                                                edge_feat_template = ef_b,
+                                             )
+                snap_end = _build_snapshot(src_b, dst_b, ts_b, ef_b, t_end_int, last_t)
+            else:
+                snap_pre = _build_pre_sequence_snapshot(
+                                                            prev_src, prev_dst, prev_ts, prev_ef,
+                                                            extra_ids, t_end_int, last_t,
+                                                            seq_len = model._sequence_length,
+                                                            edge_feat_template = ef_b,
+                                                         )
+                snap_end = _build_sequence_snapshot(
+                                                        src_b, dst_b, ts_b, ef_b,
+                                                        t_end_int, last_t,
+                                                        seq_len = model._sequence_length,
+                                                     )
             if snap_pre is None or snap_end is None:
                 continue
             last_t = t_end_int
 
-            H, states_prop = model.forward(snap_pre, commit=False, training=False)
+            H, states_prop = model.forward(snap_pre, commit = False, training = False)
             states_for_score, _ = model.compute_shadow_committed_states_for_score(
                 snap_pre, states_prop,
-                lambda_prior=0.0, lambda_saturation=0.0, training=False,
+                lambda_prior = 0.0, lambda_saturation = 0.0, training = False,
             )
 
             rnd_cand_src = np.concatenate([src_b, rnd_neg_src]).astype(np.int64)
@@ -433,10 +461,10 @@ def evaluate_split(
             rnd_logits = model.score_pairs(
                 H, snap_pre.node_ids,
                 rnd_cand_src, rnd_cand_dst,
-                states=states_for_score,
-                pair_current_ts=rnd_cand_ts,
-                query_history_current_ts=rnd_cand_ts,
-                training=False,
+                states = states_for_score,
+                pair_current_ts = rnd_cand_ts,
+                query_history_current_ts = rnd_cand_ts,
+                training = False,
             )
             rnd_logits_np = tf.reshape(rnd_logits, [-1]).numpy()
             B = int(len(src_b))
@@ -450,22 +478,22 @@ def evaluate_split(
                 ind_logits = model.score_pairs(
                     H, snap_pre.node_ids,
                     ind_cand_src, ind_cand_dst,
-                    states=states_for_score,
-                    pair_current_ts=ind_cand_ts,
-                    query_history_current_ts=ind_cand_ts,
-                    training=False,
+                    states = states_for_score,
+                    pair_current_ts = ind_cand_ts,
+                    query_history_current_ts = ind_cand_ts,
+                    training = False,
                 )
                 ind_logits_np = tf.reshape(ind_logits, [-1]).numpy()
                 ind_pos.append(ind_logits_np[:B])
                 ind_neg.append(ind_logits_np[B:])
 
-            model.forward(snap_end, commit=True, training=False)
+            model.forward(snap_end, commit = True, training = False)
             model.update_pair_recurrence(src_b, dst_b, ts_b)
             model.update_query_history(src_b, dst_b, ts_b)
             prev_bucket = (
-                np.asarray(src_b, dtype=np.int64).copy(),
-                np.asarray(dst_b, dtype=np.int64).copy(),
-                np.asarray(ts_b,  dtype=np.int64).copy(),
+                np.asarray(src_b, dtype = np.int64).copy(),
+                np.asarray(dst_b, dtype = np.int64).copy(),
+                np.asarray(ts_b,  dtype = np.int64).copy(),
                 None if ef_b is None else np.asarray(ef_b).copy(),
             )
 
@@ -485,7 +513,7 @@ def evaluate_split(
                     )
             else:
                 suffix = f"bucket {b_idx + 1}/{n_buckets} - ..."
-            progress.update(task, advance=int(src_b.shape[0]), suffix=suffix)
+            progress.update(task, advance = int(src_b.shape[0]), suffix = suffix)
 
     results: Dict[str, Dict[str, float]] = {}
 

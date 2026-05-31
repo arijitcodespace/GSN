@@ -3,56 +3,59 @@ dataset:
   root: data/
 
 model:
-  hidden: 384
-  num_heads: 12
+  hidden: 512
+  num_heads: 16
   head_dim: 32
   state_dim: 16
   num_layers: 1
-  embed_dim: 128
-  scorer: dot
+  embed_dim: 64
+  scorer: mlp
   commit_alpha: 0.999
   time_feat_dim: 8
-  time_scale: 435456000  # 14 years
+  time_scale: 31622400
   edge_gate_hidden: 32
-  dropout: 0.0
+  dropout: 0.3
   self_loops: false
   pre_message: false       # B0 ablation: feed neighbour summary into the SSM input
-  conv_cache: true        # B  ablation: persistent Mamba-2 conv cache
+  run_ssm_in_step_mode: false
+  num_chunks: 4
+  conv_cache: false        # B  ablation: persistent Mamba-2 conv cache
   conv_cache_dt_decay: null  # optional: bucket-Δt decay τ for the conv cache
   intra_bucket_seq: false  # C  ablation: per-event SSM stepping within each bucket
   conv1d_kernel_size: 24    # Mamba-2 conv kernel width (effective horizon: K * batch_events events; only active when conv_cache=true)
-  noise_scale: 0.0
+  noise_scale: 0.15
   id_dim: 64
   temp: 0.541
   pair_recurrence: false  # scorer-side pair count/recency features; false restores pre-feature architecture
-  pair_recurrence_dim: 16
+  pair_recurrence_dim: 32
   pair_recurrence_tau: null  # null = fall back to model.time_scale
   pair_recurrence_undirected: false
   pair_recurrence_reset_per_epoch: false
   query_history: true      # bounded scorer-side recent-neighbor history side channel
-  query_history_k: 512
+  query_history_k: 64
   query_history_dim: 16
   query_history_tau: null    # null = fall back to model.time_scale
-  query_history_undirected: false
-  query_history_reset_per_epoch: false
+  query_history_undirected: true
+  query_history_reset_per_epoch: true
 
 trainer:
-  lr: 1.0e-4
+  lr: 1.5e-4
   beta_1: 0.9
   beta_2: 0.999
   weight_decay: 0.0
-  clip_norm: 1.0
+  clip_norm: 10.0
   loss_fn: bce
   lambda_wr: 0.0
   epochs: 5
-  batch_events: 1024
+  batch_events: 32
   accumulate_every: 1
+  train_neg_sampler: base
   train_neg_per_pos: 1
   val_test_neg_per_pos: 1
   seed: 2020
   weights_dir: checkpoints/tgbl-canparl/
-  save_every_epoch: false  # write epoch_NNN.weights.h5 + buffers every epoch so we can post-hoc pick the actual peak
-  train_on_val: true
+  save_every_epoch: true  # write epoch_NNN.weights.h5 + buffers every epoch so we can post-hoc pick the actual peak
+  train_on_val: false
 # ---------------------------------------------------------------------------
 # Adaptive node-wise commit gate
 # Coarse-grained dataset — uniform mode already performs well here.

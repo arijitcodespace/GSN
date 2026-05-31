@@ -8,8 +8,8 @@ model:
   head_dim: 32          # hidden // num_heads
   state_dim: 16         # SSM state dim per head
   num_layers: 1
-  embed_dim: 128
-  scorer: dot
+  embed_dim: 64
+  scorer: mlp
   commit_alpha: 0.999
   time_feat_dim: 8
   # time_scale: 604800.0  # 7 days in seconds
@@ -18,23 +18,25 @@ model:
   dropout: 0.0
   self_loops: false
   pre_message: false      # B0 ablation: feed neighbour summary into the SSM input
+  run_ssm_in_step_mode: true
+  num_chunks: 32
   conv_cache: true       # B  ablation: persistent Mamba-2 conv cache
   conv_cache_dt_decay: null
   intra_bucket_seq: false # C  ablation: per-event SSM stepping within each bucket
-  conv1d_kernel_size: 8   # Mamba-2 conv kernel width (effective horizon: K * batch_events events; only active when conv_cache=true)
-  noise_scale: 0.0
+  conv1d_kernel_size: 24   # Mamba-2 conv kernel width (effective horizon: K * batch_events events; only active when conv_cache=true)
+  noise_scale: 0.15
   id_dim: 64
   temp: 0.541
   pair_recurrence: false  # scorer-side pair count/recency features; false restores pre-feature architecture
   pair_recurrence_dim: 16
   pair_recurrence_tau: null  # null = fall back to model.time_scale
   pair_recurrence_undirected: false
-  pair_recurrence_reset_per_epoch: false
-  query_history: true      # bounded scorer-side recent-neighbor history side channel
-  query_history_k: 512
-  query_history_dim: 16
-  query_history_tau: null    # null = fall back to model.time_scale
-  query_history_undirected: false
+  pair_recurrence_reset_per_epoch: true
+  query_history: true       # bounded scorer-side recent-neighbor history side channel
+  query_history_k: 1024
+  query_history_dim: 32
+  query_history_tau: 60.0    # null = fall back to model.time_scale
+  query_history_undirected: true
   query_history_reset_per_epoch: false
 
 trainer:
@@ -43,12 +45,13 @@ trainer:
   beta_2: 0.999
   weight_decay: 0.0
   clip_norm: 1.0
-  loss_fn: ce
+  loss_fn: bce
   lambda_wr: 0.0
   epochs: 10
   batch_events: 256
   accumulate_every: 1
-  train_neg_per_pos: 49
+  train_neg_sampler: base
+  train_neg_per_pos: 1
   val_test_neg_per_pos: 1
   seed: 2020
   weights_dir: checkpoints/tgbl-wiki/

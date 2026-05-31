@@ -1,4 +1,4 @@
-# GSN — Graph State Networks: Persistent Nodewise Selective State Space Models
+# GSN — Graph State Networks
 
 **Temporal link prediction on continuous-time dynamic graphs with persistent
 per-node Mamba-2 state and gated message passing.**
@@ -34,7 +34,7 @@ No `py-tgb` dependency.
   - [GSN block](#gsn-block)
   - [State tables](#state-tables)
   - [Commit modes](#commit-modes)
-  - [Conv-cache and intra-bucket sequencing](#conv-cache-and-intra-bucket-sequencing)
+  - [Mamba execution modes](#mamba-execution-modes)
 - [Training](#training)
   - [CLI](#cli)
   - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
@@ -167,14 +167,14 @@ GSN/
 │   └── checkpoints/<dataset>/  # Saved weights + activity buffers + config
 │
 ├── gsn/
-│   ├── snapshot.py             # Snapshot dataclass + bucket builder
+│   ├── snapshot.py             # Scalar + padded sequence Snapshot builders
 │   │
 │   ├── datasets/
 │   │   ├── tgb_loader.py       # Zenodo loader, TGBSplit, merge_splits
 │   │   └── negative_sampling.py# Train-time negative samplers
 │   │
 │   ├── layers/
-│   │   ├── mamba2/             # Mamba-2 SSD TF implementation (step mode)
+│   │   ├── mamba2/             # Mamba-2 SSD TF implementation (step/sequence)
 │   │   ├── gsn_block.py        # GSNBlock + PersistentGSNBlock
 │   │   ├── edge_gate.py        # Edge gating MLP
 │   │   ├── time_encoding.py    # TGAT time embedding
@@ -213,20 +213,30 @@ time-bucket mini-graph:
 ```python
 Snapshot(
     node_ids,   # [N] int64 — global node IDs in this bucket
-    edge_src,   # [E] int32 — local source indices (into node_ids)
-    edge_dst,   # [E] int32 — local destination indices
+    edge_src,   # [E] or [L, E_max] int32 — local source indices
+    edge_dst,   # [E] or [L, E_max] int32 — local destination indices
     num_nodes,  # N
     t_ref,      # reference timestamp (bucket end)
     dt,         # seconds since previous bucket
-    edge_feat,  # [E, F_e] float32 or None
-    edge_ts,    # [E] int64 or None — per-edge timestamps
-    x,          # [N, F_n] float32 or None — optional node features
+    edge_feat,  # [E, F_e] or [L, E_max, F_e] float32 or None
+    edge_ts,    # [E] or [L, E_max] int64 or None — per-edge timestamps
+    x,          # [N, F_n] or [N, L, F_n] float32 or None
 )
 ```
 
-The training loop slices the event stream into buckets of
-`trainer.batch_events` events each, builds a `Snapshot.from_events(...)`
-per bucket, and threads it through `PersistentGSNBlock`.
+`Snapshot.from_events(...)` builds a scalar snapshot. `Snapshot.concatenate(...)`
+packs a time-contiguous list of scalar snapshots into one padded sequence
+snapshot: it unions the node IDs, remaps every step's local edges into the
+shared node space, pads edge arrays to `[L, E_max]` with `-1` sentinels, and
+keeps per-step timing in `seq_t_ref` / `seq_dt`. `actual_seq_len` records how
+many real steps are present, so a short final bucket does not have to consume
+padded SSM tokens.
+
+In step mode, the training loop slices the stream into buckets of
+`trainer.batch_events` events, builds one `Snapshot.from_events(...)` per
+bucket, and threads it through `PersistentGSNBlock`. In sequence mode, each
+bucket contains exactly `trainer.batch_events` one-event steps (except the
+final short bucket), which are packed with `Snapshot.concatenate(...)`.
 
 For an *evaluation* bucket, the snapshot is built with extra placeholder
 node IDs that cover all required negative-sample sources and
@@ -239,7 +249,7 @@ that will be scored later in the same bucket.
 the per-node SSM state in and gets the updated state out. One block does:
 
 ```
-[Read state]  →  Mamba-2 SSM step (with optional conv cache)
+[Read state]  →  Mamba-2 SSM step or sequence call
               →  one-hop edge-gated message passing
               →  optional FFN
               →  [Updated node embeddings, updated state]
@@ -286,9 +296,29 @@ S ← (1 − α) · S + α · s'
   See `gsn/layers/adaptive_commit_gate.py` for the full formulation.
   Enable by setting `adaptive_commit.commit_mode: adaptive_hazard`.
 
-### Conv-cache and intra-bucket sequencing
+### Mamba execution modes
 
-Two ablation flags toggle key behaviours of the Mamba-2 step:
+`run_ssm_in_step_mode` chooses how the Mamba-2 core is invoked:
+
+- **`run_ssm_in_step_mode: true`** — legacy/default behavior. Each bucket
+  is one aggregated graph snapshot and the block calls `Mamba2SSD.step(...)`
+  once per node. In this mode, `trainer.batch_events` means "events per
+  snapshot/bucket", `sequence_length = 1`, and `num_chunks = 1`.
+- **`run_ssm_in_step_mode: false`** — sequence mode. `trainer.batch_events`
+  becomes the Mamba sequence length. The trainer/evaluator split the bucket
+  into one-event scalar snapshots, pack them with `Snapshot.concatenate(...)`,
+  and call `Mamba2SSD.call(...)` over `[num_local_nodes, L, hidden]`. The
+  final embedding used for scoring is the last real step. A short final
+  bucket is processed with repeated `step(...)` calls so padded tokens do not
+  alter the committed state.
+
+Sequence mode requires `batch_events > 0`, `sequence_length % num_chunks == 0`,
+`conv_cache: false`, and `intra_bucket_seq: false`; these are validated at
+model/trainer construction. The sequence SSD path uses the same stable decay
+parameterisation as step mode (`A = -softplus(A)`) before exponentials, which
+avoids exploding SSM state and immediate NaN loss on configs such as CanParl.
+
+Additional ablation flags:
 
 - **`conv_cache: true`** — keep a persistent Mamba-2 conv1d cache per
   node so that the causal 1-D conv inside the SSM step sees true
@@ -302,7 +332,9 @@ Two ablation flags toggle key behaviours of the Mamba-2 step:
   so identity at init). Lets the committed state ingest interaction
   information directly.
 
-These are all per-config and default to `false` in most configs.
+These are all per-config. Existing dataset configs explicitly set
+`run_ssm_in_step_mode` so their behavior is not ambiguous; MOOC, UCI, and
+CanParl currently exercise sequence mode.
 
 ---
 
@@ -401,6 +433,10 @@ trainer- and evaluator-reported metrics for the same epoch, given the
 same `seed`, `batch_events`, and `metric_batch_size`. This is enforced
 by the test workflow (`pytest gsn/tests/`).
 
+In sequence mode, `--batch_events` must match the checkpoint's saved
+`sequence_length` because it defines the Mamba sequence shape. The evaluator
+validates this before running.
+
 ### CLI
 
 ```text
@@ -473,10 +509,12 @@ reference values; consult the per-dataset YAML for tuned defaults.
 | `dropout` | float | FFN dropout rate. |
 | `self_loops` | bool | Add self-loops in message passing. |
 | `pre_message` | bool | **B0** ablation: feed neighbour summary into SSM input (gated, init = 0). |
-| `conv_cache` | bool | **B** ablation: persistent Mamba-2 conv1d cache across snapshots. |
+| `run_ssm_in_step_mode` | bool | `true` = legacy per-bucket `Mamba2SSD.step(...)`; `false` = pack one-event snapshots and call sequence-mode `Mamba2SSD.call(...)`. |
+| `num_chunks` | int | Number of SSD chunks in sequence mode. Must divide `trainer.batch_events`; ignored/forced to `1` in step mode. |
+| `conv_cache` | bool | **B** ablation: persistent Mamba-2 conv1d cache across snapshots. Step-mode only. |
 | `conv_cache_dt_decay` | float \| null | Optional Δt-staleness decay τ applied to the read cache. |
-| `intra_bucket_seq` | bool | **C** ablation: per-event SSM stepping within each bucket. |
-| `conv1d_kernel_size` | int | Mamba-2 conv kernel width (effective horizon: K × `batch_events` events; only active with `conv_cache`). |
+| `intra_bucket_seq` | bool | **C** ablation: per-event SSM stepping within each bucket. Step-mode only. |
+| `conv1d_kernel_size` | int | Mamba-2 conv kernel width. In sequence mode it mixes within the packed sequence; in step mode persistent history requires `conv_cache`. |
 | `noise_scale` | float | Gaussian noise injected into state during training (regulariser). |
 | `id_dim` | int | Width of trainable per-node ID embedding (0 to disable). |
 | `temp` | float | Scorer temperature (in the unparameterised raw scale; the model applies softplus internally). |
@@ -498,13 +536,13 @@ reference values; consult the per-dataset YAML for tuned defaults.
 |-----|------|-------------|
 | `lr` | float | Adam learning rate. |
 | `beta_1`, `beta_2` | float | Adam momenta. |
-| `weight_decay` | float | AdamW-style decoupled weight decay (0 = vanilla Adam). |
+| `weight_decay` | float | AdamW-style decoupled weight decay. If the installed Keras lacks AdamW, `0.0` falls back to Adam and non-zero values fail fast. |
 | `clip_norm` | float \| null | Global-norm gradient clip. |
 | `loss_fn` | str | `ce` (categorical-ish ranking) or `bce`. |
 | `lambda_wr` | float | Weight of the write-penalty loss (discourages over-eager state writes). |
 | `epochs` | int | Number of training epochs. |
 | `initial_epoch` | int | First-epoch index (for resume bookkeeping). |
-| `batch_events` | int | Events per snapshot/bucket. |
+| `batch_events` | int | Step mode: events per aggregated snapshot/bucket. Sequence mode: fixed Mamba sequence length and number of one-event steps per packed snapshot. |
 | `accumulate_every` | int | Gradient accumulation count (1 = no accumulation). |
 | `train_neg_per_pos` | int | Negatives per positive during training. |
 | `val_test_neg_per_pos` | int | Negatives per positive during eval. Set to 1 for DyGLib-style; -1 means "use precomputed all-negatives" (legacy path). |
@@ -577,9 +615,13 @@ far. All checkpoint files are gitignored.
 - **`time_scale`** has a much bigger effect than people expect. As a
   rule of thumb, pick something near the median inter-event Δt of the
   dataset. The bundled configs already do this.
-- **`batch_events`** trades off temporal fidelity vs throughput. Very
-  small buckets preserve order but kill GPU utilisation. Conversely
-  very large buckets aggregate too much into one SSM step.
+- **`batch_events`** trades off temporal fidelity vs throughput. In step
+  mode, very small buckets preserve order but kill GPU utilisation, while
+  very large buckets aggregate too much into one SSM step. In sequence
+  mode, it is the actual sequence length, so memory grows with `L`.
+- **Sequence mode** requires `run_ssm_in_step_mode: false`,
+  `conv_cache: false`, `intra_bucket_seq: false`, and `batch_events % num_chunks == 0`.
+  Use moderate `batch_events` values; CanParl currently uses `32`.
 - **`val_test_neg_per_pos: 1`** is the DyGLib/DyGMamba convention and is
   what `evaluate.py` expects by default. Setting it higher activates a
   different, multi-negative-per-positive ranking path.
@@ -591,11 +633,10 @@ far. All checkpoint files are gitignored.
   decisions in that regime.
 - **`pg.ipynb`, `debug.py`** in `examples/` are scratch space. They are
   intentionally not part of the API but are kept tracked.
-- The Mamba-2 implementation in `gsn/layers/mamba2/` runs in **step
-  mode** (sequence_length = 1) — one snapshot at a time. Enable
-  `conv_cache: true` to recover the conv1d's short-range temporal mixing
-  across steps; without it the local conv sees only zeros and is
-  effectively disabled.
+- In step mode, enable `conv_cache: true` if you want the Mamba conv1d to
+  see streaming history across snapshots; without it the step call uses
+  zero context. In sequence mode, the conv operates over the packed
+  sequence directly and persistent `conv_cache` is disabled.
 
 ---
 
