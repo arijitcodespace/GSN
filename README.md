@@ -16,7 +16,7 @@ for every node across snapshots. Each snapshot runs:
 5.  **Commit** the updated state back to the table (uniform or learned
     per-node EMA), ready for the next snapshot.
 
-The framework is built on **TensorFlow / Keras (>=2.15)** and targets the
+The framework is built on **TensorFlow / Keras (>=2.16)** and targets the
 [TGB](https://tgb.complexdatalab.com/) benchmark datasets, downloaded
 directly from the [Zenodo record 7213796](https://zenodo.org/record/7213796).
 No `py-tgb` dependency.
@@ -57,7 +57,7 @@ No `py-tgb` dependency.
 
 ## Installation
 
-GSN targets Python ≥ 3.10 and TensorFlow ≥ 2.15. A CUDA-enabled GPU is
+GSN targets Python ≥ 3.10 and TensorFlow ≥ 2.16. A CUDA-enabled GPU is
 strongly recommended.
 
 ```bash
@@ -66,13 +66,13 @@ conda create -n gsn python=3.10 -y
 conda activate gsn
 
 # 2. Install TensorFlow with GPU support, then install GSN editable
-pip install "tensorflow[and-cuda]>=2.15"
+pip install "tensorflow[and-cuda]>=2.16"
 pip install -e ".[dev]"      # editable + black/isort/pytest
 ```
 
 Direct runtime dependencies (declared in `setup.py`):
 
-- `tensorflow >= 2.15`
+- `tensorflow >= 2.16`
 - `einops >= 0.7`
 - `numpy >= 1.24`
 - `pyyaml >= 6.0`
