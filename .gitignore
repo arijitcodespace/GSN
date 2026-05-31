@@ -102,5 +102,6 @@ copilot_verdict.md
 gpt_context.md
 verdict.md
 */debug.py
+*/loop_v0.py
 **/*.ipynb
 
