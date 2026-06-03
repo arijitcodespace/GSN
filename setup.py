@@ -7,7 +7,7 @@ setup(
     packages=find_packages(include=["gsn", "gsn.*"]),
     python_requires=">=3.10",
     install_requires=[
-        "tensorflow>=2.15",
+        "tensorflow>=2.16",
         "einops>=0.7",
         "numpy>=1.24",
         "pyyaml>=6.0",
