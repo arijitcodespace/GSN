@@ -131,6 +131,8 @@ class GSNBlock(layers.Layer):
         self.num_chunks = int(num_chunks)
         self.time_feat_dim = int(time_feat_dim)
         self.time_scale = float(time_scale)
+        self.edge_gate_hidden = int(edge_gate_hidden)
+        self.dropout = float(dropout)
         self.self_loops = bool(self_loops)
         self.pre_message = bool(pre_message)
         self.conv_cache  = bool(conv_cache)
@@ -142,24 +144,24 @@ class GSNBlock(layers.Layer):
 
         # SSM core (sequence_length=1, num_chunks=1 -> pure step mode)
         self.mamba2 = Mamba2SSD(
-                                    num_heads = num_heads,
-                                    head_dim = head_dim,
-                                    state_dim = state_dim,
-                                    d_model = hidden,
-                                    sequence_length = sequence_length,
-                                    num_chunks = num_chunks,
+                                    num_heads = self.num_heads,
+                                    head_dim = self.head_dim,
+                                    state_dim = self.state_dim,
+                                    d_model = self.hidden,
+                                    sequence_length = self.sequence_length,
+                                    num_chunks = self.num_chunks,
                                     conv1d_kernel_size = self.conv1d_kernel_size,
                                     name = (f"{name}_mamba2" if name else "mamba2"),
                                 )
 
         # Time encoders
         self.node_time_enc = TGATTimeEncoding(
-                                                dim = time_feat_dim,
+                                                dim = self.time_feat_dim,
                                                 time_scale = time_scale,
                                                 name = (f"{name}_node_te" if name else "node_te")
                                              )
         self.edge_time_enc = TGATTimeEncoding(
-                                                dim = time_feat_dim,
+                                                dim = self.time_feat_dim,
                                                 time_scale = time_scale,
                                                 name = (f"{name}_edge_te" if name else "edge_te"),
                                              )
@@ -167,13 +169,13 @@ class GSNBlock(layers.Layer):
         # Projections
         # lin_in: project (node_feat | degree_feats) -> hidden
         # set input_dim lazily in build()
-        self.lin_in   = layers.Dense(hidden, use_bias = True,  name = "lin_in")
-        self.lin_time = layers.Dense(hidden, use_bias = False, name = "lin_time")
-        self.msg_lin  = layers.Dense(hidden, use_bias = False, name = "msg_lin")
+        self.lin_in   = layers.Dense(self.hidden, use_bias = True,  name = "lin_in")
+        self.lin_time = layers.Dense(self.hidden, use_bias = False, name = "lin_time")
+        self.msg_lin  = layers.Dense(self.hidden, use_bias = False, name = "msg_lin")
 
         self.edge_gate = EdgeGate(
-                                    num_heads = num_heads,
-                                    hidden = edge_gate_hidden,
+                                    num_heads = self.num_heads,
+                                    hidden = self.edge_gate_hidden,
                                     name = (f"{name}_edge_gate" if name else "edge_gate")
                                  )
 
@@ -182,10 +184,10 @@ class GSNBlock(layers.Layer):
 
         self.ffn = keras.Sequential(
                                         [
-                                            layers.Dense(4 * hidden, activation = "gelu", name = f"{name}_ffn_dense_0"),
+                                            layers.Dense(4 * self.hidden, activation = "gelu", name = f"{name}_ffn_dense_0"),
                                             layers.LayerNormalization(epsilon = 1e-6, name = f"{name}_ffn_layernorm"),
-                                            layers.Dense(hidden, name = f"{name}_ffn_dense_1"),
-                                            layers.Dropout(dropout, name = f"{name}_ffn_dropout")
+                                            layers.Dense(self.hidden, name = f"{name}_ffn_dense_1"),
+                                            layers.Dropout(self.dropout, name = f"{name}_ffn_dropout")
                                         ], 
                                         name = "ffn"
                                     )
@@ -207,7 +209,7 @@ class GSNBlock(layers.Layer):
         # committed SSM state. Disabled by default so backwards-compatible.
         if self.pre_message:
             self.pre_msg_lin = layers.Dense(
-                                                hidden,
+                                                self.hidden,
                                                 use_bias = False,
                                                 name = "pre_msg_lin"
                                            )
@@ -230,7 +232,7 @@ class GSNBlock(layers.Layer):
         # branch fires (see ``GSNLinkPredictor._build_from_dummy``).
         if self.intra_bucket_seq:
             self.event_msg_lin = layers.Dense(
-                                                hidden,
+                                                self.hidden,
                                                 use_bias = False,
                                                 name = "event_msg_lin",
                                               )
@@ -864,6 +866,8 @@ class GSNBlock(layers.Layer):
                             time_feat_dim       = self.time_feat_dim,
                             time_scale          = self.time_scale,
                             self_loops          = self.self_loops,
+                            edge_gate_hidden    = self.edge_gate_hidden,
+                            dropout             = self.dropout,
                             pre_message         = self.pre_message,
                             conv_cache          = self.conv_cache,
                             conv_cache_dt_decay = self.conv_cache_dt_decay,
