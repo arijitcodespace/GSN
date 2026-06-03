@@ -263,7 +263,8 @@ def _download(
 
     tried = "\n  ".join(urls)
     raise RuntimeError(
-        f"Download failed after trying {len(urls)} URL(s):\n  {tried}"
+        f"Download failed after trying {len(urls)} URL(s):\n  {tried}\n "
+        f"Please download the dataset from {urls[-1]}."
     ) from last_err
 
 
