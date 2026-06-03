@@ -482,7 +482,8 @@ can hide.
 
 Every config has four top-level sections: `dataset`, `model`, `trainer`,
 `adaptive_commit`. The examples below use `configs/uci.yaml` for
-reference values; consult the per-dataset YAML for tuned defaults.
+reference values;
+**Note that the rest of the .yaml files are not *tuned* defaults. They are just placeholders.**
 
 ### `dataset` section
 
